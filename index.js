@@ -105,8 +105,36 @@ async function updateStatus(data) {
   } catch (e) { console.error("Update status failed:", e.message); }
 }
 
+// ---- AUTO-SETUP BOT ROLE PERMISSIONS ----
+async function setupBotRolePermissions(guild) {
+  try {
+    const botRole = guild.members.me?.roles.highest;
+    if (!botRole) { console.log("[DEBUG] Bot has no role in guild"); return; }
+
+    const requiredPerms = [
+      "ViewChannel",
+      "SendMessages",
+      "ReadMessageHistory",
+      "Connect",
+      "Speak",
+      "UseVoiceActivity",
+      "MoveMembers",
+      "DeafenMembers",
+      "MuteMembers"
+    ];
+
+    await botRole.setPermissions(requiredPerms);
+    const actualPerms = botRole.permissions.toArray();
+    console.log(`[DEBUG] Updated bot role in ${guild.name}. Permissions: ${actualPerms.join(", ")}`);
+    await log("info", "bot_join", `Bot role permissions configured in ${guild.name} — has: ${actualPerms.join(", ")}`, { guild_id: guild.id });
+  } catch (e) {
+    console.error("[DEBUG] Failed to setup role permissions:", e.message);
+    await log("error", "error", `Role setup failed: ${e.message}`, { guild_id: guild.id });
+  }
+}
+
 // ---- BOT READY ----
-client.once("clientReady", () => {
+client.once("ready", () => {
   console.log(`✅ Bot online as ${client.user.tag}`);
   log("success", "bot_join", `Bot started: ${client.user.tag}`);
   setInterval(() => {
@@ -116,13 +144,22 @@ client.once("clientReady", () => {
   }, 30000);
 });
 
+// Auto-setup permissions when bot joins a guild
+client.on("guildCreate", async (guild) => {
+  console.log(`[DEBUG] Bot joined guild: ${guild.name}`);
+  await setupBotRolePermissions(guild);
+});
+
 // ---- COMMANDS ----
 client.on("messageCreate", async (message) => {
   if (message.author.bot) return;
 
   if (message.content === "!join") {
     const channel = message.member?.voice.channel;
-    if (!channel) return message.reply("❌ Join a voice channel first!");
+    if (!channel) {
+      try { await message.reply("❌ Join a voice channel first!"); } catch (e) { console.error("Reply failed:", e.message); }
+      return;
+    }
 
     currentConnection = joinVoiceChannel({
       channelId: channel.id,
@@ -132,22 +169,20 @@ client.on("messageCreate", async (message) => {
       selfMute: false,
     });
 
-    currentConnection.subscribe(audioPlayer);
-
-    // Wait for connection to be fully Ready before listening
-    // This is critical — subscribing before Ready means Discord won't send RTP packets
     try {
-      await entersState(currentConnection, VoiceConnectionStatus.Ready, 10_000);
-      console.log("[DEBUG] Voice connection is Ready — starting listener");
+      // Wait for Ready BEFORE subscribing (30s timeout for slower networks)
+      await entersState(currentConnection, VoiceConnectionStatus.Ready, 30_000);
+      console.log("[DEBUG] Voice connection is Ready — subscribing player");
+      currentConnection.subscribe(audioPlayer);
+      try { await message.reply(`Joined **${channel.name}**! I'm listening...`); } catch (e) { console.error("Reply failed:", e.message); }
     } catch (err) {
-      console.error("[DEBUG] Connection never became Ready:", err.message);
+      console.error("[DEBUG] Connection failed (check bot permissions in voice channel):", err.message);
       currentConnection.destroy();
-      return message.reply("❌ Failed to connect to voice channel.");
+      try { await message.reply("❌ Failed to connect — check bot has Connect + Speak + Read History permissions."); } catch (e) { console.error("Reply failed:", e.message); }
     }
 
     await log("success", "bot_join", `Joined ${channel.name}`, { channel: channel.name, guild_id: channel.guild.id });
     await updateStatus({ status: "online", guild_name: channel.guild.name, guild_id: channel.guild.id, channel: channel.name });
-    message.reply(`✅ Joined **${channel.name}**! I'm listening...`);
     startListening(currentConnection, channel);
   }
 
@@ -158,7 +193,7 @@ client.on("messageCreate", async (message) => {
       currentConnection = null;
       await log("info", "bot_leave", "Bot left voice channel");
       await updateStatus({ status: "offline" });
-      message.reply("👋 Left the voice channel.");
+      try { await message.reply("👋 Left the voice channel."); } catch (e) { console.error("Reply failed:", e.message); }
     }
   }
 });
