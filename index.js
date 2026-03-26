@@ -240,7 +240,23 @@ client.on("interactionCreate", async (interaction) => {
   }
 });
 
-// ✅ FIX: Improved voice listening with better error handling
+// ✅ Rate limiting & caching for transcription
+const transcriptionCache = new Map();
+const rateLimiter = new Map();
+const speakingUsers = new Map();
+
+function isRateLimited(userId) {
+  const lastCall = rateLimiter.get(userId) || 0;
+  const now = Date.now();
+  if (now - lastCall < 500) return true;
+  rateLimiter.set(userId, now);
+  return false;
+}
+
+function cacheKey(data) {
+  return require("crypto").createHash("md5").update(JSON.stringify(data)).digest("hex");
+}
+
 function startListening(guildState, channel) {
   const receiver = guildState.connection.receiver;
   const userState = guildState.userState;
@@ -261,8 +277,23 @@ function startListening(guildState, channel) {
       console.log(`[DEBUG] Audio too short (${duration}ms < ${MIN_AUDIO_MS}ms), skipping`);
       return;
     }
-    console.log(`[DEBUG] Flushing ${username}: ${opusChunks.length} Opus packets, ${duration}ms`);
-    log("info", "speaking_end", `${username} stopped`, { username, user_id: userId });
+
+    // ✅ Rate limiting check
+    if (isRateLimited(userId)) {
+      console.log(`[DEBUG] Rate limit: ${username} speaking too frequently, buffering next utterance`);
+      return;
+    }
+
+    console.log(`[DEBUG] Flushing ${username}: ${opusChunks.length} packets, ${duration}ms`);
+    log("info", "speaking_end", `${username} stopped speaking`, { username, user_id: userId, duration_ms: duration });
+    
+    // Track speaker stats
+    const speakerData = speakingUsers.get(userId) || { username, totalSpeakTime: 0, utterances: 0 };
+    speakerData.totalSpeakTime += duration;
+    speakerData.utterances += 1;
+    speakerData.lastSpoke = Date.now();
+    speakingUsers.set(userId, speakerData);
+
     processAudio(guildState, opusChunks, userId, username, channel.name, utteranceStart);
   }
 
@@ -273,22 +304,28 @@ function startListening(guildState, channel) {
 
     console.log(`[DEBUG] Subscribing to: ${username}`);
     const opusStream = receiver.subscribe(userId, { end: { behavior: EndBehaviorType.Manual } });
-    userState[userId] = { stream: opusStream, opusChunks: [], silenceTimer: null, utteranceStart: null, hasAudio: false, username };
+    userState[userId] = { 
+      stream: opusStream, 
+      opusChunks: [], 
+      silenceTimer: null, 
+      utteranceStart: null, 
+      hasAudio: false, 
+      username,
+      packetCount: 0 
+    };
 
-    // ✅ FIX: Log when data arrives to diagnose audio reception issues
     opusStream.on("data", (packet) => {
       const state = userState[userId];
       if (!state) return;
 
-      if (!packet || packet.length === 0) {
-        console.log(`[DEBUG] Empty packet from ${username}, skipping`);
-        return;
-      }
+      if (!packet || packet.length === 0) return;
+
+      state.packetCount++;
 
       if (!state.hasAudio) {
         state.hasAudio = true;
         state.utteranceStart = Date.now();
-        console.log(`[DEBUG] 🎙️ FIRST PACKET from ${username} (${packet.length} bytes) — audio detected!`);
+        console.log(`[DEBUG] 🎙️ ${username} started speaking (packet ${state.packetCount})`);
         log("info", "speaking_start", `${username} started speaking`, { user_id: userId, username });
         if (guildState.isSpeaking) {
           guildState.audioPlayer.stop();
@@ -298,10 +335,7 @@ function startListening(guildState, channel) {
 
       state.opusChunks.push(packet);
       if (state.silenceTimer) clearTimeout(state.silenceTimer);
-      state.silenceTimer = setTimeout(() => {
-        console.log(`[DEBUG] Silence detected for ${username} after ${SILENCE_TIMEOUT_MS}ms`);
-        flushAndProcess(userId);
-      }, SILENCE_TIMEOUT_MS);
+      state.silenceTimer = setTimeout(() => flushAndProcess(userId), SILENCE_TIMEOUT_MS);
     });
 
     opusStream.on("error", (err) => {
@@ -313,7 +347,7 @@ function startListening(guildState, channel) {
       const state = userState[userId];
       if (state?.silenceTimer) clearTimeout(state.silenceTimer);
       delete userState[userId];
-      console.log(`[DEBUG] Stream closed for ${username}`);
+      console.log(`[DEBUG] Stream closed for ${username} (${state?.packetCount || 0} packets received)`);
     });
   }
 
@@ -321,20 +355,22 @@ function startListening(guildState, channel) {
   const initialMembers = channel.members.filter(m => !m.user.bot);
   console.log(`[DEBUG] Pre-subscribing ${initialMembers.size} members...`);
   initialMembers.forEach(m => {
-    console.log(`[DEBUG] Initial member: ${m.user.username}`);
     subscribeUser(m.id);
   });
 
-  // Handle members joining/leaving mid-session
+  // Handle members joining/leaving
   client.on("voiceStateUpdate", (oldState, newState) => {
     if (newState.member?.user.bot) return;
     const joinedChannel = newState.channelId === channel.id && oldState.channelId !== channel.id;
     const leftChannel = oldState.channelId === channel.id && newState.channelId !== channel.id;
     if (joinedChannel) {
-      console.log(`[DEBUG] ${newState.member?.user.username} joined — subscribing`);
+      console.log(`[DEBUG] ${newState.member?.user.username} joined`);
       subscribeUser(newState.id);
     } else if (leftChannel) {
-      console.log(`[DEBUG] ${oldState.member?.user.username} left — unsubscribing`);
+      const userData = speakingUsers.get(oldState.id);
+      if (userData) {
+        console.log(`[DEBUG] ${userData.username} left (spoke ${userData.utterances}x, total ${userData.totalSpeakTime}ms)`);
+      }
       if (userState[oldState.id]?.silenceTimer) clearTimeout(userState[oldState.id].silenceTimer);
       delete userState[oldState.id];
     }
@@ -347,30 +383,60 @@ async function processAudio(guildState, opusChunks, userId, username, channelNam
   const mp3Path = path.join("/tmp", `tts_${Date.now()}.mp3`);
 
   try {
-    fs.writeFileSync(rawPath, Buffer.concat(opusChunks.map(p => Buffer.from(p))));
-    console.log(`[DEBUG] Decoding Opus: ${opusChunks.length} packets`);
+    // Write & decode audio
+    const pcmBuffer = Buffer.concat(opusChunks.map(p => Buffer.from(p)));
+    fs.writeFileSync(rawPath, pcmBuffer);
+    console.log(`[DEBUG] Opus: ${opusChunks.length} packets (${pcmBuffer.length} bytes) → decoding`);
+    
     execSync(`"${ffmpegPath}" -f s16le -ar 48000 -ac 2 -i "${rawPath}" -ar 16000 -ac 1 "${wavPath}" -y 2>/dev/null`, { stdio: "pipe" });
     fs.unlinkSync(rawPath);
 
-    const transcription = await openai.audio.transcriptions.create({ file: fs.createReadStream(wavPath), model: "whisper-1" });
-    const userText = transcription.text?.trim();
+    // Check cache for transcription
+    const audioHash = cacheKey(pcmBuffer);
+    let userText = transcriptionCache.get(audioHash);
+    
     if (!userText) {
-      console.log("[DEBUG] Whisper returned empty transcription");
-      return;
+      console.log("[DEBUG] Transcribing with Whisper...");
+      const transcription = await openai.audio.transcriptions.create({ 
+        file: fs.createReadStream(wavPath), 
+        model: "whisper-1" 
+      });
+      userText = transcription.text?.trim();
+      if (!userText) {
+        console.log("[DEBUG] Whisper returned empty result");
+        return;
+      }
+      transcriptionCache.set(audioHash, userText);
+      console.log(`[DEBUG] Cached: "${userText.substring(0, 50)}..."`);
+    } else {
+      console.log("[DEBUG] Cache hit!");
     }
+
     log("success", "stt_output", `STT: ${userText}`, { username, user_id: userId });
 
+    // Get GPT response
     const gptRes = await openai.chat.completions.create({
-      model: "gpt-4.1-mini",
-      messages: [{ role: "system", content: "Real-time voice assistant. Be concise." }, { role: "user", content: userText }]
+      model: process.env.GPT_MODEL || "gpt-4-mini",
+      messages: [
+        { role: "system", content: process.env.SYSTEM_PROMPT || "You are a real-time voice assistant. Be concise and friendly." },
+        { role: "user", content: userText }
+      ],
+      max_tokens: 150
     });
     const botReply = gptRes.choices[0].message.content?.trim();
+    if (!botReply) return;
     log("success", "gpt_response", `GPT: ${botReply}`, { username });
 
+    // Generate TTS
     const audioStream = await elevenlabs.textToSpeech.convert(process.env.ELEVENLABS_VOICE_ID || "21m00Tcm4TlvDq8ikWAM", {
       model_id: process.env.ELEVENLABS_MODEL || "eleven_turbo_v2_5",
       text: botReply,
-      voice_settings: { stability: 0.5, similarity_boost: 0.75, style: 0.0, use_speaker_boost: true }
+      voice_settings: {
+        stability: parseFloat(process.env.ELEVENLABS_STABILITY || "0.5"),
+        similarity_boost: parseFloat(process.env.ELEVENLABS_SIMILARITY || "0.75"),
+        style: parseFloat(process.env.ELEVENLABS_STYLE || "0.0"),
+        use_speaker_boost: true
+      }
     });
 
     await new Promise((resolve, reject) => {
@@ -380,19 +446,33 @@ async function processAudio(guildState, opusChunks, userId, username, channelNam
       writeStream.on("error", reject);
     });
 
+    // Play audio
     const resource = createAudioResource(mp3Path);
     guildState.isSpeaking = true;
     guildState.audioPlayer.play(resource);
+    log("info", "playback_start", `Playing response to ${username}`);
 
     guildState.audioPlayer.once(AudioPlayerStatus.Idle, () => {
       guildState.isSpeaking = false;
       try { fs.unlinkSync(mp3Path); } catch {}
+      log("info", "playback_end", "Playback finished");
     });
 
-    await dashFetch("Conversation", "POST", { user_id: userId, username, guild_id: guildState.guildId, channel: channelName, user_text: userText, bot_response: botReply, duration_ms: Date.now() - startMs });
+    // Save conversation
+    const duration = Date.now() - startMs;
+    await dashFetch("Conversation", "POST", { 
+      user_id: userId, 
+      username, 
+      guild_id: guildState.guildId, 
+      channel: channelName, 
+      user_text: userText, 
+      bot_response: botReply, 
+      duration_ms: duration 
+    });
+
   } catch (err) {
-    log("error", "error", `Error: ${err.message}`, { username });
-    console.error("[DEBUG] Audio processing error:", err.message);
+    log("error", "error", `Process audio failed: ${err.message}`, { username });
+    console.error("[DEBUG]", err.message);
   } finally {
     try { fs.unlinkSync(rawPath); } catch {}
     try { fs.unlinkSync(wavPath); } catch {}
