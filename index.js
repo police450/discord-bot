@@ -82,19 +82,19 @@ client.on("messageCreate", async (message) => {
     }
 
     // Retry logic for voice connection with stuck state detection
-    let retries = 5;
+    let retries = 3;
     let connected = false;
 
     while (retries > 0 && !connected) {
       try {
-        const attempt = 6 - retries;
-        console.log(`[DEBUG] Attempting voice connection (attempt ${attempt}/5)...`);
+        const attempt = 4 - retries;
+        console.log(`[DEBUG] Attempting voice connection (attempt ${attempt}/3)...`);
 
         // Destroy previous connection if exists
         if (currentConnection) {
           try { currentConnection.destroy(); } catch {}
           currentConnection = null;
-          await new Promise(resolve => setTimeout(resolve, 1000)); // Longer wait before retry
+          await new Promise(resolve => setTimeout(resolve, 2000)); // Wait for cleanup
         }
 
         currentConnection = joinVoiceChannel({
@@ -142,10 +142,10 @@ client.on("messageCreate", async (message) => {
         };
         currentConnection.on("stateChange", connectionMonitor);
 
-        // Aggressive timeout for UDP detection
+        // Wait for connection with extended timeout for network latency
         const readyPromise = Promise.race([
-          entersState(currentConnection, VoiceConnectionStatus.Ready, 8_000),
-          new Promise((_, reject) => setTimeout(() => reject(new Error("Voice ready timeout — possible UDP block")), 9_000))
+          entersState(currentConnection, VoiceConnectionStatus.Ready, 20_000),
+          new Promise((_, reject) => setTimeout(() => reject(new Error("Voice ready timeout — possible UDP block or network delay")), 21_000))
         ]);
 
         await readyPromise;
