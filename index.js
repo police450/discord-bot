@@ -106,19 +106,41 @@ client.on("messageCreate", async (message) => {
         });
 
         // Detect stuck state (signalling loop)
-        let lastState = null;
         let signallingCount = 0;
-        const stuckDetector = (state) => {
-          if (state.status === "signalling") signallingCount++;
-          if (signallingCount > 2) {
-            console.log("[DEBUG] Stuck in signalling loop — likely UDP connection issue");
-            throw new Error("UDP connection failed (stuck in signalling)");
+        const connectionMonitor = (oldState, newState) => {
+          console.log(`[DEBUG] Voice state: ${oldState.status} → ${newState.status}`);
+
+          // Detect stuck signalling
+          if (newState.status === "signalling") {
+            signallingCount++;
+            if (signallingCount > 2) {
+              console.log("[DEBUG] Stuck in signalling loop — likely UDP connection issue");
+              throw new Error("UDP connection failed (stuck in signalling)");
+            }
+          } else {
+            signallingCount = 0;
           }
-          lastState = state;
+
+          // Handle disconnects and attempt recovery
+          if (newState.status === VoiceConnectionStatus.Disconnected) {
+            console.log("[DEBUG] Disconnected! Attempting recovery...");
+            if (oldState.status !== VoiceConnectionStatus.Connecting) {
+              try {
+                Promise.race([
+                  entersState(currentConnection, VoiceConnectionStatus.Signalling, 5_000),
+                  entersState(currentConnection, VoiceConnectionStatus.Connected, 5_000),
+                ]).catch(err => {
+                  console.log("[DEBUG] Recovery failed:", err.message);
+                  currentConnection?.destroy();
+                  currentConnection = null;
+                });
+              } catch (e) {
+                console.error("[DEBUG] Recovery error:", e.message);
+              }
+            }
+          }
         };
-        currentConnection.on("stateChange", (oldState, newState) => {
-          stuckDetector(newState);
-        });
+        currentConnection.on("stateChange", connectionMonitor);
 
         // Aggressive timeout for UDP detection
         const readyPromise = Promise.race([
@@ -134,7 +156,10 @@ client.on("messageCreate", async (message) => {
         await message.reply(`✅ Joined ${channel.name}! Listening...`);
         await log("success", "bot_join", `Joined ${channel.name}`, { channel: channel.name, guild_id: channel.guild.id });
 
-      } catch (err) {
+        // Start listening for voice
+        startListening(currentConnection, channel);
+
+        } catch (err) {
         const errorMsg = err.message || "Unknown error";
         console.error(`[DEBUG] Attempt ${6 - retries} failed: ${errorMsg}`);
         retries--;
