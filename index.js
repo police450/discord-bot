@@ -161,20 +161,20 @@ client.on("messageCreate", async (message) => {
 
         } catch (err) {
         const errorMsg = err.message || "Unknown error";
-        console.error(`[DEBUG] Attempt ${6 - retries} failed: ${errorMsg}`);
+        console.error(`[DEBUG] Attempt ${4 - retries} failed: ${errorMsg}`);
         retries--;
 
         try { currentConnection?.destroy(); } catch {}
         currentConnection = null;
 
         if (retries > 0) {
-          const waitTime = 4000; // Increased delay
-          console.log(`[DEBUG] Retrying in 4 seconds... (${retries} attempts left)`);
+          const waitTime = 5000;
+          console.log(`[DEBUG] Retrying in 5 seconds... (${retries} attempts left)`);
           await new Promise(resolve => setTimeout(resolve, waitTime));
         } else {
-          console.error("[DEBUG] Connection exhausted — likely network/firewall issue");
-          await message.reply(`❌ Cannot connect: ${errorMsg}
-→ Check: UDP firewall, bot perms, run \`!join\` again`);
+          console.error("[DEBUG] Connection failed after 3 attempts");
+          await message.reply(`❌ Cannot connect to voice: ${errorMsg}
+→ Check: UDP firewall, bot perms, Discord intents`);
           await log("error", "error", `Failed to join ${channel.name}: ${errorMsg}`, { channel: channel.name, guild_id: channel.guild.id });
         }
       }
