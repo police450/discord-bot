@@ -44,6 +44,7 @@ const ELEVENLABS_STYLE = parseFloat(process.env.ELEVENLABS_STYLE || "0.0");
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMembers,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
     GatewayIntentBits.GuildVoiceStates,
