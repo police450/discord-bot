@@ -81,13 +81,21 @@ client.on("messageCreate", async (message) => {
       return;
     }
 
-    // Retry logic for voice connection
-    let retries = 3;
+    // Retry logic for voice connection with stuck state detection
+    let retries = 5;
     let connected = false;
 
     while (retries > 0 && !connected) {
       try {
-        console.log(`[DEBUG] Attempting voice connection (attempt ${4 - retries}/3)...`);
+        const attempt = 6 - retries;
+        console.log(`[DEBUG] Attempting voice connection (attempt ${attempt}/5)...`);
+
+        // Destroy previous connection if exists
+        if (currentConnection) {
+          try { currentConnection.destroy(); } catch {}
+          currentConnection = null;
+          await new Promise(resolve => setTimeout(resolve, 1000)); // Longer wait before retry
+        }
 
         currentConnection = joinVoiceChannel({
           channelId: channel.id,
@@ -97,30 +105,28 @@ client.on("messageCreate", async (message) => {
           selfMute: false,
         });
 
-        // Handle connection state changes & auto-reconnect
-        const stateChangeHandler = async (oldState, newState) => {
-          console.log(`[DEBUG] Voice state: ${oldState.status} → ${newState.status}`);
-          if (newState.status === VoiceConnectionStatus.Disconnected && oldState.status !== VoiceConnectionStatus.Connecting) {
-            try {
-              await Promise.race([
-                entersState(currentConnection, VoiceConnectionStatus.Signalling, 5_000),
-                entersState(currentConnection, VoiceConnectionStatus.Connected, 5_000),
-              ]);
-            } catch (err) {
-              console.log("[DEBUG] Auto-reconnection failed, destroying:", err.message);
-              try { currentConnection.destroy(); } catch {}
-              currentConnection = null;
-            }
+        // Detect stuck state (signalling loop)
+        let lastState = null;
+        let signallingCount = 0;
+        const stuckDetector = (state) => {
+          if (state.status === "signalling") signallingCount++;
+          if (signallingCount > 2) {
+            console.log("[DEBUG] Stuck in signalling loop — likely UDP connection issue");
+            throw new Error("UDP connection failed (stuck in signalling)");
           }
+          lastState = state;
         };
-        currentConnection.on("stateChange", stateChangeHandler);
+        currentConnection.on("stateChange", (oldState, newState) => {
+          stuckDetector(newState);
+        });
 
-        // Wait for connection with timeout
-        await Promise.race([
-          entersState(currentConnection, VoiceConnectionStatus.Ready, 10_000),
-          new Promise((_, reject) => setTimeout(() => reject(new Error("Connection timeout")), 12_000))
+        // Aggressive timeout for UDP detection
+        const readyPromise = Promise.race([
+          entersState(currentConnection, VoiceConnectionStatus.Ready, 8_000),
+          new Promise((_, reject) => setTimeout(() => reject(new Error("Voice ready timeout — possible UDP block")), 9_000))
         ]);
 
+        await readyPromise;
         console.log("[DEBUG] Voice connection established — subscribing player");
         currentConnection.subscribe(audioPlayer);
         connected = true;
@@ -129,25 +135,25 @@ client.on("messageCreate", async (message) => {
         await log("success", "bot_join", `Joined ${channel.name}`, { channel: channel.name, guild_id: channel.guild.id });
 
       } catch (err) {
-        console.error(`[DEBUG] Connection attempt failed: ${err.message}`);
+        const errorMsg = err.message || "Unknown error";
+        console.error(`[DEBUG] Attempt ${6 - retries} failed: ${errorMsg}`);
         retries--;
 
         try { currentConnection?.destroy(); } catch {}
         currentConnection = null;
 
         if (retries > 0) {
-          console.log(`[DEBUG] Retrying in 2 seconds... (${retries} attempts left)`);
-          await new Promise(resolve => setTimeout(resolve, 2000));
+          const waitTime = 4000; // Increased delay
+          console.log(`[DEBUG] Retrying in 4 seconds... (${retries} attempts left)`);
+          await new Promise(resolve => setTimeout(resolve, waitTime));
         } else {
-          console.error("[DEBUG] All connection attempts failed");
-          await message.reply(`❌ Failed after 3 attempts: ${err.message}
-→ Check Discord intents, firewall, perms. Try !join again.`);
-          await log("error", "error", `Failed to join ${channel.name}: ${err.message}`, { channel: channel.name, guild_id: channel.guild.id });
+          console.error("[DEBUG] Connection exhausted — likely network/firewall issue");
+          await message.reply(`❌ Cannot connect: ${errorMsg}
+→ Check: UDP firewall, bot perms, run \`!join\` again`);
+          await log("error", "error", `Failed to join ${channel.name}: ${errorMsg}`, { channel: channel.name, guild_id: channel.guild.id });
         }
       }
     }
-
-    if (!connected) return;
   }
   if (message.content === "!leave") {
     const conn = getVoiceConnection(message.guild.id);
