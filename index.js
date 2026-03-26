@@ -108,4 +108,16 @@ client.on("messageCreate", async (message) => {
   }
 });
 
-client.login(process.env.DISCORD_TOKEN);
+// Wait for libsodium to be ready, then start bot
+async function startBot() {
+  try {
+    await sodium.ready;
+    console.log("[DEBUG] libsodium ready ✅");
+    client.login(process.env.DISCORD_TOKEN);
+  } catch (e) {
+    console.error("[DEBUG] libsodium failed:", e.message);
+    process.exit(1);
+  }
+}
+
+startBot();
