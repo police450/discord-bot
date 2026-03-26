@@ -18,11 +18,19 @@ const MIN_AUDIO_MS = parseInt(process.env.MIN_AUDIO_MS || "300");
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const elevenlabs = new ElevenLabsClient({ apiKey: process.env.ELEVENLABS_API_KEY });
 
+// ✅ FIX: Enable ALL required intents including GUILD_VOICE_STATES
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent, GatewayIntentBits.GuildVoiceStates],
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMembers,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent,
+    GatewayIntentBits.GuildVoiceStates,
+    GatewayIntentBits.DirectMessages,
+  ],
 });
 
-const guildConnections = new Map(); // Map<guildId, { connection, audioPlayer, isSpeaking, userState }>
+const guildConnections = new Map();
 const startTime = Date.now();
 
 function getGuildState(guildId) {
@@ -32,7 +40,8 @@ function getGuildState(guildId) {
       audioPlayer: createAudioPlayer(),
       isSpeaking: false,
       isMuted: false,
-      userState: {}
+      userState: {},
+      guildId,
     });
   }
   return guildConnections.get(guildId);
@@ -58,14 +67,19 @@ async function log(level, event, message, extra = {}) {
 async function setupBotRolePermissions(guild) {
   try {
     const botRole = guild.members.me?.roles.highest;
-    if (!botRole) return;
+    if (!botRole) {
+      console.log(`[DEBUG] Bot has no role in ${guild.name}`);
+      return;
+    }
     const requiredPerms = ["ViewChannel", "SendMessages", "ReadMessageHistory", "Connect", "Speak", "UseVoiceActivity"];
-    // Also set deafen/mute for guild-level (not needed per-channel)
-    if (botRole.permissions.has("Administrator")) return;
+    if (botRole.permissions.has("Administrator")) {
+      console.log(`[DEBUG] Bot has Admin in ${guild.name} — all perms OK`);
+      return;
+    }
     await botRole.setPermissions(requiredPerms);
-    console.log(`[DEBUG] Bot role updated in ${guild.name}`);
+    console.log(`[DEBUG] Bot role updated in ${guild.name}: ${requiredPerms.join(", ")}`);
   } catch (e) {
-    console.error("[DEBUG] Role setup failed:", e.message);
+    console.error(`[DEBUG] Role setup failed: ${e.message}`);
   }
 }
 
@@ -116,9 +130,24 @@ client.on("interactionCreate", async (interaction) => {
       await interaction.reply({ content: "❌ Join a voice channel first!", ephemeral: true });
       return;
     }
-    const botPerms = channel.guild.members.me?.permissionsIn(channel);
-    if (!botPerms?.has("Connect") || !botPerms?.has("Speak")) {
-      await interaction.reply({ content: `❌ Missing Connect or Speak permission in ${channel.name}`, ephemeral: true });
+
+    // ✅ FIX: Detailed permission diagnostics
+    const botMember = channel.guild.members.me;
+    const botPerms = botMember?.permissionsIn(channel);
+    const guildPerms = botMember?.permissions;
+    
+    console.log(`[DEBUG] Guild: ${channel.guild.name} (${channel.guild.id})`);
+    console.log(`[DEBUG] Channel: ${channel.name} (${channel.id})`);
+    console.log(`[DEBUG] Guild perms: ${guildPerms?.toArray().join(", ") || "NONE"}`);
+    console.log(`[DEBUG] Channel perms: ${botPerms?.toArray().join(", ") || "NONE"}`);
+    console.log(`[DEBUG] Bot role: ${botMember?.roles.highest.name} (position: ${botMember?.roles.highest.position})`);
+
+    if (!botPerms?.has("Connect")) {
+      await interaction.reply({ content: `❌ Missing **Connect** permission in **${ channel.name}**`, ephemeral: true });
+      return;
+    }
+    if (!botPerms?.has("Speak")) {
+      await interaction.reply({ content: `❌ Missing **Speak** permission in **${ channel.name}**`, ephemeral: true });
       return;
     }
 
@@ -134,6 +163,7 @@ client.on("interactionCreate", async (interaction) => {
 
     while (retries > 0 && !connected) {
       try {
+        console.log(`[DEBUG] Attempting connection (retry ${4 - retries}/3)...`);
         guildState.connection = joinVoiceChannel({
           channelId: channel.id,
           guildId: channel.guild.id,
@@ -144,26 +174,32 @@ client.on("interactionCreate", async (interaction) => {
 
         const readyPromise = Promise.race([
           entersState(guildState.connection, VoiceConnectionStatus.Ready, 15_000),
-          new Promise((_, reject) => setTimeout(() => reject(new Error("Connection timeout")), 16_000))
+          new Promise((_, reject) => setTimeout(() => reject(new Error("Connection timeout after 15s")), 16_000))
         ]);
 
         await readyPromise;
         guildState.connection.subscribe(guildState.audioPlayer);
         connected = true;
 
+        console.log(`[DEBUG] ✅ Voice connection established`);
         await interaction.editReply(`✅ Joined ${channel.name}! Listening...`);
         await log("success", "bot_join", `Joined ${channel.name}`, { channel: channel.name, guild_id: guildId });
         startListening(guildState, channel);
 
       } catch (err) {
         retries--;
+        console.error(`[DEBUG] Connection error: ${err.message}`);
         try { guildState.connection?.destroy(); } catch {}
         guildState.connection = null;
 
         if (retries === 0) {
-          await interaction.editReply(`❌ Cannot connect to voice. Check UDP/firewall.`);
-          await log("error", "error", `Failed to join`, { guild_id: guildId });
+          await interaction.editReply(`❌ Cannot connect to voice after 3 attempts.
+• Check bot has **Connect** & **Speak** perms
+• Verify firewall allows UDP
+• Ensure intents are enabled in Discord Dev Portal`);
+          await log("error", "error", `Failed to join: ${err.message}`, { guild_id: guildId });
         } else {
+          console.log(`[DEBUG] Retrying in 3 seconds...`);
           await new Promise(resolve => setTimeout(resolve, 3000));
         }
       }
@@ -204,10 +240,11 @@ client.on("interactionCreate", async (interaction) => {
   }
 });
 
-// Start listening for voice from guild members
+// ✅ FIX: Improved voice listening with better error handling
 function startListening(guildState, channel) {
   const receiver = guildState.connection.receiver;
   const userState = guildState.userState;
+  console.log(`[DEBUG] startListening: Receiver ready for ${channel.name}`);
 
   function flushAndProcess(userId) {
     const state = userState[userId];
@@ -220,7 +257,11 @@ function startListening(guildState, channel) {
     state.hasAudio = false;
     state.utteranceStart = null;
 
-    if (duration < 300) return;
+    if (duration < MIN_AUDIO_MS) {
+      console.log(`[DEBUG] Audio too short (${duration}ms < ${MIN_AUDIO_MS}ms), skipping`);
+      return;
+    }
+    console.log(`[DEBUG] Flushing ${username}: ${opusChunks.length} Opus packets, ${duration}ms`);
     log("info", "speaking_end", `${username} stopped`, { username, user_id: userId });
     processAudio(guildState, opusChunks, userId, username, channel.name, utteranceStart);
   }
@@ -230,41 +271,70 @@ function startListening(guildState, channel) {
     const user = client.users.cache.get(userId);
     const username = user?.username || userId;
 
+    console.log(`[DEBUG] Subscribing to: ${username}`);
     const opusStream = receiver.subscribe(userId, { end: { behavior: EndBehaviorType.Manual } });
     userState[userId] = { stream: opusStream, opusChunks: [], silenceTimer: null, utteranceStart: null, hasAudio: false, username };
 
+    // ✅ FIX: Log when data arrives to diagnose audio reception issues
     opusStream.on("data", (packet) => {
-      if (!packet?.length || guildState.isMuted) return;
+      const state = userState[userId];
+      if (!state) return;
 
-      if (!userState[userId]?.hasAudio) {
-        userState[userId].hasAudio = true;
-        userState[userId].utteranceStart = Date.now();
-        console.log(`[DEBUG] 🎙️ ${username} speaking`);
-        log("info", "speaking_start", `${username} started`, { user_id: userId, username });
+      if (!packet || packet.length === 0) {
+        console.log(`[DEBUG] Empty packet from ${username}, skipping`);
+        return;
+      }
+
+      if (!state.hasAudio) {
+        state.hasAudio = true;
+        state.utteranceStart = Date.now();
+        console.log(`[DEBUG] 🎙️ FIRST PACKET from ${username} (${packet.length} bytes) — audio detected!`);
+        log("info", "speaking_start", `${username} started speaking`, { user_id: userId, username });
         if (guildState.isSpeaking) {
           guildState.audioPlayer.stop();
           guildState.isSpeaking = false;
         }
       }
 
-      userState[userId].opusChunks.push(packet);
-      if (userState[userId].silenceTimer) clearTimeout(userState[userId].silenceTimer);
-      userState[userId].silenceTimer = setTimeout(() => flushAndProcess(userId), 1500);
+      state.opusChunks.push(packet);
+      if (state.silenceTimer) clearTimeout(state.silenceTimer);
+      state.silenceTimer = setTimeout(() => {
+        console.log(`[DEBUG] Silence detected for ${username} after ${SILENCE_TIMEOUT_MS}ms`);
+        flushAndProcess(userId);
+      }, SILENCE_TIMEOUT_MS);
+    });
+
+    opusStream.on("error", (err) => {
+      console.error(`[DEBUG] Stream error for ${username}: ${err.message}`);
+      delete userState[userId];
     });
 
     opusStream.on("close", () => {
-      if (userState[userId]?.silenceTimer) clearTimeout(userState[userId].silenceTimer);
+      const state = userState[userId];
+      if (state?.silenceTimer) clearTimeout(state.silenceTimer);
       delete userState[userId];
+      console.log(`[DEBUG] Stream closed for ${username}`);
     });
   }
 
-  channel.members.filter(m => !m.user.bot).forEach(m => subscribeUser(m.id));
+  // Subscribe all current non-bot members
+  const initialMembers = channel.members.filter(m => !m.user.bot);
+  console.log(`[DEBUG] Pre-subscribing ${initialMembers.size} members...`);
+  initialMembers.forEach(m => {
+    console.log(`[DEBUG] Initial member: ${m.user.username}`);
+    subscribeUser(m.id);
+  });
 
+  // Handle members joining/leaving mid-session
   client.on("voiceStateUpdate", (oldState, newState) => {
     if (newState.member?.user.bot) return;
-    if (newState.channelId === channel.id && oldState.channelId !== channel.id) {
+    const joinedChannel = newState.channelId === channel.id && oldState.channelId !== channel.id;
+    const leftChannel = oldState.channelId === channel.id && newState.channelId !== channel.id;
+    if (joinedChannel) {
+      console.log(`[DEBUG] ${newState.member?.user.username} joined — subscribing`);
       subscribeUser(newState.id);
-    } else if (oldState.channelId === channel.id && newState.channelId !== channel.id) {
+    } else if (leftChannel) {
+      console.log(`[DEBUG] ${oldState.member?.user.username} left — unsubscribing`);
       if (userState[oldState.id]?.silenceTimer) clearTimeout(userState[oldState.id].silenceTimer);
       delete userState[oldState.id];
     }
@@ -278,12 +348,16 @@ async function processAudio(guildState, opusChunks, userId, username, channelNam
 
   try {
     fs.writeFileSync(rawPath, Buffer.concat(opusChunks.map(p => Buffer.from(p))));
+    console.log(`[DEBUG] Decoding Opus: ${opusChunks.length} packets`);
     execSync(`"${ffmpegPath}" -f s16le -ar 48000 -ac 2 -i "${rawPath}" -ar 16000 -ac 1 "${wavPath}" -y 2>/dev/null`, { stdio: "pipe" });
     fs.unlinkSync(rawPath);
 
     const transcription = await openai.audio.transcriptions.create({ file: fs.createReadStream(wavPath), model: "whisper-1" });
     const userText = transcription.text?.trim();
-    if (!userText) return;
+    if (!userText) {
+      console.log("[DEBUG] Whisper returned empty transcription");
+      return;
+    }
     log("success", "stt_output", `STT: ${userText}`, { username, user_id: userId });
 
     const gptRes = await openai.chat.completions.create({
@@ -315,31 +389,28 @@ async function processAudio(guildState, opusChunks, userId, username, channelNam
       try { fs.unlinkSync(mp3Path); } catch {}
     });
 
-    await dashFetch("Conversation", "POST", { user_id: userId, username, guild_id: guildId, channel: channelName, user_text: userText, bot_response: botReply, duration_ms: Date.now() - startMs });
+    await dashFetch("Conversation", "POST", { user_id: userId, username, guild_id: guildState.guildId, channel: channelName, user_text: userText, bot_response: botReply, duration_ms: Date.now() - startMs });
   } catch (err) {
     log("error", "error", `Error: ${err.message}`, { username });
-    console.error("[DEBUG]", err.message);
+    console.error("[DEBUG] Audio processing error:", err.message);
   } finally {
     try { fs.unlinkSync(rawPath); } catch {}
     try { fs.unlinkSync(wavPath); } catch {}
   }
 }
 
-// Check for pending announcements and read them aloud
 async function checkAndReadAnnouncements(guildState) {
   try {
     const announcements = await dashFetch("Announcement?filter={\"status\":\"pending\"}&sort=scheduled_time&limit=10", "GET");
     if (!announcements || announcements.length === 0) return;
 
     for (const ann of announcements) {
-      // If scheduled, check if it's time yet
       if (ann.scheduled_time) {
         const scheduledTime = new Date(ann.scheduled_time).getTime();
         const now = Date.now();
-        if (now < scheduledTime) continue; // Not time yet, skip
+        if (now < scheduledTime) continue;
       }
 
-      // Interrupt if bot is speaking
       if (guildState.isSpeaking) {
         guildState.audioPlayer.stop();
         guildState.isSpeaking = false;
@@ -347,10 +418,7 @@ async function checkAndReadAnnouncements(guildState) {
       }
 
       try {
-        // Generate TTS for announcement
         const mp3Path = path.join("/tmp", `announcement_${Date.now()}.mp3`);
-        const elevenlabs = new ElevenLabsClient({ apiKey: process.env.ELEVENLABS_API_KEY });
-        
         const audioStream = await elevenlabs.textToSpeech.convert(process.env.ELEVENLABS_VOICE_ID || "21m00Tcm4TlvDq8ikWAM", {
           model_id: process.env.ELEVENLABS_MODEL || "eleven_turbo_v2_5",
           text: `Announcement from the developers: ${ann.message}`,
@@ -369,13 +437,11 @@ async function checkAndReadAnnouncements(guildState) {
           writeStream.on("error", reject);
         });
 
-        // Play announcement
         const resource = createAudioResource(mp3Path);
         guildState.isSpeaking = true;
         guildState.audioPlayer.play(resource);
         await log("success", "announcement", `Announcement: ${ann.message}`);
 
-        // Mark as sent
         await dashFetch(`Announcement/${ann.id}`, "PUT", { status: "sent", sent_at: new Date().toISOString() });
 
         guildState.audioPlayer.once(AudioPlayerStatus.Idle, () => {
@@ -383,7 +449,6 @@ async function checkAndReadAnnouncements(guildState) {
           try { fs.unlinkSync(mp3Path); } catch {}
         });
 
-        // Wait for announcement to finish before next one
         await new Promise(resolve => setTimeout(resolve, 2000));
       } catch (e) {
         console.error("[DEBUG] Announcement TTS failed:", e.message);
@@ -395,19 +460,6 @@ async function checkAndReadAnnouncements(guildState) {
   }
 }
 
-// Wait for libsodium to be ready, then start bot
-async function startBot() {
-  try {
-    await sodium.ready;
-    console.log("[DEBUG] libsodium ready ✅");
-    client.login(process.env.DISCORD_TOKEN);
-  } catch (e) {
-    console.error("[DEBUG] libsodium failed:", e.message);
-    process.exit(1);
-  }
-}
-
-// Check and play looping messages
 async function checkAndPlayLoopingMessages(guildState) {
   try {
     const looping = await dashFetch("ScheduledMessage?filter={\"enabled\":true}", "GET");
@@ -418,9 +470,8 @@ async function checkAndPlayLoopingMessages(guildState) {
       const intervalMs = msg.interval_minutes * 60 * 1000;
       const now = Date.now();
 
-      if (now - lastPlayed < intervalMs) continue; // Not time yet
+      if (now - lastPlayed < intervalMs) continue;
 
-      // Play message
       if (guildState.isSpeaking) {
         guildState.audioPlayer.stop();
         guildState.isSpeaking = false;
@@ -428,8 +479,6 @@ async function checkAndPlayLoopingMessages(guildState) {
 
       try {
         const mp3Path = path.join("/tmp", `loop_${Date.now()}.mp3`);
-        const elevenlabs = new ElevenLabsClient({ apiKey: process.env.ELEVENLABS_API_KEY });
-        
         const audioStream = await elevenlabs.textToSpeech.convert(process.env.ELEVENLABS_VOICE_ID || "21m00Tcm4TlvDq8ikWAM", {
           model_id: process.env.ELEVENLABS_MODEL || "eleven_turbo_v2_5",
           text: msg.message,
@@ -457,7 +506,6 @@ async function checkAndPlayLoopingMessages(guildState) {
           try { fs.unlinkSync(mp3Path); } catch {}
         });
 
-        // Update last_played
         await dashFetch(`ScheduledMessage/${msg.id}`, "PUT", { last_played: new Date().toISOString() });
       } catch (e) {
         console.error("[DEBUG] Looping message TTS failed:", e.message);
@@ -468,7 +516,6 @@ async function checkAndPlayLoopingMessages(guildState) {
   }
 }
 
-// Check announcements and looping messages every 30 seconds for all active guilds
 setInterval(() => {
   guildConnections.forEach((guildState, guildId) => {
     if (guildState.connection) {
@@ -477,5 +524,16 @@ setInterval(() => {
     }
   });
 }, 30000);
+
+async function startBot() {
+  try {
+    await sodium.ready;
+    console.log("[DEBUG] libsodium ready ✅");
+    client.login(process.env.DISCORD_TOKEN);
+  } catch (e) {
+    console.error("[DEBUG] libsodium failed:", e.message);
+    process.exit(1);
+  }
+}
 
 startBot();
