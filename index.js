@@ -194,6 +194,11 @@ client.on("interactionCreate", async (interaction) => {
           selfMute: false,
         });
 
+        // Log all state transitions for debugging
+        guildState.connection.on("stateChange", (oldState, newState) => {
+          console.log(`[DEBUG] Voice state: ${oldState.status} → ${newState.status}`);
+        });
+
         // Handle disconnects — auto-reconnect
         guildState.connection.on(VoiceConnectionStatus.Disconnected, async () => {
           console.log("[DEBUG] Disconnected — attempting reconnect...");
@@ -202,8 +207,7 @@ client.on("interactionCreate", async (interaction) => {
               entersState(guildState.connection, VoiceConnectionStatus.Signalling, 5_000),
               entersState(guildState.connection, VoiceConnectionStatus.Connecting, 5_000),
             ]);
-            await entersState(guildState.connection, VoiceConnectionStatus.Ready, 20_000);
-            console.log("[DEBUG] Reconnected ✅");
+            console.log("[DEBUG] Reconnecting...");
           } catch {
             console.log("[DEBUG] Reconnect failed — destroying connection");
             guildState.connection.destroy();
@@ -213,12 +217,8 @@ client.on("interactionCreate", async (interaction) => {
 
         guildState.connection.subscribe(guildState.audioPlayer);
 
-        await new Promise(resolve => setTimeout(resolve, 2000));
-        const state = guildState.connection.state.status;
-        console.log(`[DEBUG] Connection state after 2s: ${state}`);
-
-        try { await interaction.editReply(`✅ Joined ${channel.name}! (State: ${state}) — listening for voice...`); } catch {}
-        await log("success", "bot_join", `Joined ${channel.name} (state: ${state})`, { channel: channel.name, guild_id: guildId });
+        try { await interaction.editReply(`✅ Joined ${channel.name}! Waiting for voice connection...`); } catch {}
+        await log("success", "bot_join", `Joined ${channel.name}`, { channel: channel.name, guild_id: guildId });
         startListening(guildState, channel);
 
       } catch (err) {
@@ -268,30 +268,9 @@ const processingUsers = new Set();
 
 function startListening(guildState, channel) {
   const receiver = guildState.connection.receiver;
-  console.log(`[DEBUG] ✅ startListening: Opus→ffmpeg pipeline for ${channel.name}`);
-
-  // Wait for Ready state before attaching speaking listener
-  // On Railway, connection starts in signalling; UDP punch-through happens async
-  const attachSpeaking = () => {
-    const status = guildState.connection?.state?.status;
-    console.log(`[DEBUG] Connection status when attaching speaking listener: ${status}`);
-    attachSpeakingListener(guildState, channel, receiver);
-  };
-
-  if (guildState.connection.state.status === VoiceConnectionStatus.Ready) {
-    attachSpeaking();
-  } else {
-    entersState(guildState.connection, VoiceConnectionStatus.Ready, 60_000)
-      .then(() => {
-        console.log("[DEBUG] Connection became Ready — attaching speaking listener");
-        attachSpeaking();
-      })
-      .catch((err) => {
-        console.error(`[DEBUG] Connection never became Ready: ${err.message}`);
-        // Attach anyway — some partial voice data may still flow
-        attachSpeaking();
-      });
-  }
+  console.log(`[DEBUG] ✅ startListening for ${channel.name}`);
+  // Attach immediately — speaking events will fire once UDP is established
+  attachSpeakingListener(guildState, channel, receiver);
 }
 
 function attachSpeakingListener(guildState, channel, receiver) {
@@ -364,11 +343,6 @@ function attachSpeakingListener(guildState, channel, receiver) {
   });
 
   console.log(`[DEBUG] receiver.speaking listener attached ✅`);
-  
-  // Re-attach if connection drops and reconnects
-  guildState.connection.on(VoiceConnectionStatus.Ready, () => {
-    console.log("[DEBUG] Connection re-entered Ready — speaking listener already active");
-  });
 }
 
 async function processAudio(guildState, wavPath, userId, username, channelName, startMs) {
@@ -580,6 +554,15 @@ setInterval(() => {
     }
   });
 }, 30000);
+
+// Catch ALL unhandled promise rejections — prevent any crash
+process.on("unhandledRejection", (err) => {
+  console.error("[DEBUG] Unhandled rejection (caught):", err?.message || err);
+});
+
+process.on("uncaughtException", (err) => {
+  console.error("[DEBUG] Uncaught exception (caught):", err?.message || err);
+});
 
 async function startBot() {
   try {
