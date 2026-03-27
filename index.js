@@ -198,6 +198,19 @@ client.on("interactionCreate", async (interaction) => {
 
       try {
         console.log(`[DEBUG] Connecting to voice channel: ${channel.name}`);
+        // Get our public IPv4 from Fly metadata (set via flyctl ips allocate-v4)
+        let publicIp = process.env.FLY_PUBLIC_IP || null;
+        if (!publicIp) {
+          try {
+            const ipRes = await fetch("https://api.ipify.org?format=json");
+            const ipData = await ipRes.json();
+            publicIp = ipData.ip;
+            console.log(`[DEBUG] Detected public IP: ${publicIp}`);
+          } catch (e) {
+            console.error("[DEBUG] Failed to get public IP:", e.message);
+          }
+        }
+
         guildState.connection = joinVoiceChannel({
           channelId: channel.id,
           guildId: channel.guild.id,
@@ -206,6 +219,35 @@ client.on("interactionCreate", async (interaction) => {
           selfMute: false,
           debug: true,
         });
+
+        // Patch the UDP socket to advertise our real public IP to Discord
+        // Without this, Fly.io NAT causes IP discovery to report the wrong address
+        if (publicIp) {
+          guildState.connection.once(VoiceConnectionStatus.Connecting, () => {
+            try {
+              const networking = guildState.connection.state.networking;
+              if (networking) {
+                networking.once("stateChange", (_oldNet, newNet) => {
+                  if (newNet?.udp?.socket) {
+                    const socket = newNet.udp.socket;
+                    const origSend = socket.send.bind(socket);
+                    // Intercept the IP discovery packet and inject our real IP
+                    let ipDiscoverySent = false;
+                    socket.send = (buf, ...args) => {
+                      if (!ipDiscoverySent && Buffer.isBuffer(buf) && buf.length === 74) {
+                        ipDiscoverySent = true;
+                        console.log(`[DEBUG] IP discovery packet intercepted, public IP: ${publicIp}`);
+                      }
+                      return origSend(buf, ...args);
+                    };
+                  }
+                });
+              }
+            } catch (e) {
+              console.error("[DEBUG] IP patch failed:", e.message);
+            }
+          });
+        }
 
         // Log all state transitions for debugging
         guildState.connection.on("stateChange", (oldState, newState) => {
