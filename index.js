@@ -488,57 +488,41 @@ function attachSpeakingListener(guildState, channel, receiver) {
 }
 
 async function processAudio(guildState, wavPath, userId, username, channelName, startMs) {
-  // wavPath is already a 16kHz mono WAV file ready for Whisper (converted by ffmpeg in startListening)
   const mp3Path = path.join("/tmp", `tts_${Date.now()}.mp3`);
 
   try {
-    console.log(`[DEBUG] Transcribing WAV with Whisper: ${wavPath}`);
-    const transcription = await getOpenAI().audio.transcriptions.create({ 
-      file: fs.createReadStream(wavPath), 
-      model: process.env.STT_MODEL || "whisper-1"
+    console.log(`[DEBUG] Sending audio to Base44 processVoiceInput...`);
+    
+    // Read WAV file and send to Base44
+    const wavBuffer = fs.readFileSync(wavPath);
+    const formData = new FormData();
+    formData.append("audio", new Blob([wavBuffer], { type: "audio/wav" }), "audio.wav");
+    formData.append("username", username);
+    formData.append("userId", userId);
+    formData.append("guildId", guildState.guildId);
+    formData.append("channelName", channelName);
+
+    const DASHBOARD_API_URL = process.env.DASHBOARD_API_URL;
+    const response = await fetch(`${DASHBOARD_API_URL}/functions/processVoiceInput`, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${process.env.DASHBOARD_API_KEY}`
+      },
+      body: formData
     });
-    const userText = transcription.text?.trim();
-    if (!userText) {
-      console.log("[DEBUG] Whisper returned empty/silent result, skipping");
-      return;
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`Base44 error: ${response.status} ${errorText}`);
     }
-    console.log(`[DEBUG] STT: "${userText}"`);
 
-    log("success", "stt_output", `STT: ${userText}`, { username, user_id: userId });
+    // Response is MP3 audio
+    const mp3Buffer = await response.arrayBuffer();
+    console.log(`[DEBUG] Received MP3 from Base44: ${mp3Buffer.byteLength} bytes`);
 
-    // Get GPT response
-    const gptRes = await getOpenAI().chat.completions.create({
-      model: process.env.GPT_MODEL || "gpt-4-mini",
-      messages: [
-        { role: "system", content: process.env.SYSTEM_PROMPT || "You are a real-time voice assistant. Be concise and friendly." },
-        { role: "user", content: userText }
-      ],
-      max_tokens: 150
-    });
-    const botReply = gptRes.choices[0].message.content?.trim();
-    if (!botReply) return;
-    log("success", "gpt_response", `GPT: ${botReply}`, { username });
+    // Save MP3 and play
+    fs.writeFileSync(mp3Path, Buffer.from(mp3Buffer));
 
-    // Generate TTS
-    const audioStream = await getElevenLabs().textToSpeech.convert(process.env.ELEVENLABS_VOICE_ID || "21m00Tcm4TlvDq8ikWAM", {
-      model_id: process.env.ELEVENLABS_MODEL || "eleven_turbo_v2_5",
-      text: botReply,
-      voice_settings: {
-        stability: parseFloat(process.env.ELEVENLABS_STABILITY || "0.5"),
-        similarity_boost: parseFloat(process.env.ELEVENLABS_SIMILARITY || "0.75"),
-        style: parseFloat(process.env.ELEVENLABS_STYLE || "0.0"),
-        use_speaker_boost: true
-      }
-    });
-
-    await new Promise((resolve, reject) => {
-      const writeStream = fs.createWriteStream(mp3Path);
-      audioStream.pipe(writeStream);
-      writeStream.on("finish", resolve);
-      writeStream.on("error", reject);
-    });
-
-    // Play audio
     const resource = createAudioResource(mp3Path);
     guildState.isSpeaking = true;
     guildState.audioPlayer.play(resource);
@@ -548,18 +532,6 @@ async function processAudio(guildState, wavPath, userId, username, channelName, 
       guildState.isSpeaking = false;
       try { fs.unlinkSync(mp3Path); } catch {}
       log("info", "playback_end", "Playback finished");
-    });
-
-    // Save conversation
-    const duration = Date.now() - startMs;
-    await dashFetch("Conversation", "POST", { 
-      user_id: userId, 
-      username, 
-      guild_id: guildState.guildId, 
-      channel: channelName, 
-      user_text: userText, 
-      bot_response: botReply, 
-      duration_ms: duration 
     });
 
   } catch (err) {
@@ -590,40 +562,10 @@ async function checkAndReadAnnouncements(guildState) {
       }
 
       try {
-        const mp3Path = path.join("/tmp", `announcement_${Date.now()}.mp3`);
-        const audioStream = await getElevenLabs().textToSpeech.convert(process.env.ELEVENLABS_VOICE_ID || "21m00Tcm4TlvDq8ikWAM", {
-          model_id: process.env.ELEVENLABS_MODEL || "eleven_turbo_v2_5",
-          text: `Announcement from the developers: ${ann.message}`,
-          voice_settings: {
-            stability: parseFloat(process.env.ELEVENLABS_STABILITY || "0.5"),
-            similarity_boost: parseFloat(process.env.ELEVENLABS_SIMILARITY || "0.75"),
-            style: parseFloat(process.env.ELEVENLABS_STYLE || "0.0"),
-            use_speaker_boost: true,
-          },
-        });
-
-        await new Promise((resolve, reject) => {
-          const writeStream = fs.createWriteStream(mp3Path);
-          audioStream.pipe(writeStream);
-          writeStream.on("finish", resolve);
-          writeStream.on("error", reject);
-        });
-
-        const resource = createAudioResource(mp3Path);
-        guildState.isSpeaking = true;
-        guildState.audioPlayer.play(resource);
-        await log("success", "announcement", `Announcement: ${ann.message}`);
-
+        console.log("[DEBUG] Skipping announcement — use Base44 processVoiceInput for TTS");
         await dashFetch(`Announcement/${ann.id}`, "PUT", { status: "sent", sent_at: new Date().toISOString() });
-
-        guildState.audioPlayer.once(AudioPlayerStatus.Idle, () => {
-          guildState.isSpeaking = false;
-          try { fs.unlinkSync(mp3Path); } catch {}
-        });
-
-        await new Promise(resolve => setTimeout(resolve, 2000));
       } catch (e) {
-        console.error("[DEBUG] Announcement TTS failed:", e.message);
+        console.error("[DEBUG] Announcement processing failed:", e.message);
         await dashFetch(`Announcement/${ann.id}`, "PUT", { status: "failed" });
       }
     }
@@ -650,37 +592,10 @@ async function checkAndPlayLoopingMessages(guildState) {
       }
 
       try {
-        const mp3Path = path.join("/tmp", `loop_${Date.now()}.mp3`);
-        const audioStream = await getElevenLabs().textToSpeech.convert(process.env.ELEVENLABS_VOICE_ID || "21m00Tcm4TlvDq8ikWAM", {
-          model_id: process.env.ELEVENLABS_MODEL || "eleven_turbo_v2_5",
-          text: msg.message,
-          voice_settings: {
-            stability: parseFloat(process.env.ELEVENLABS_STABILITY || "0.5"),
-            similarity_boost: parseFloat(process.env.ELEVENLABS_SIMILARITY || "0.75"),
-            style: parseFloat(process.env.ELEVENLABS_STYLE || "0.0"),
-            use_speaker_boost: true,
-          },
-        });
-
-        await new Promise((resolve, reject) => {
-          const writeStream = fs.createWriteStream(mp3Path);
-          audioStream.pipe(writeStream);
-          writeStream.on("finish", resolve);
-          writeStream.on("error", reject);
-        });
-
-        const resource = createAudioResource(mp3Path);
-        guildState.isSpeaking = true;
-        guildState.audioPlayer.play(resource);
-
-        guildState.audioPlayer.once(AudioPlayerStatus.Idle, () => {
-          guildState.isSpeaking = false;
-          try { fs.unlinkSync(mp3Path); } catch {}
-        });
-
+        console.log("[DEBUG] Skipping looping message — use Base44 processVoiceInput for TTS");
         await dashFetch(`ScheduledMessage/${msg.id}`, "PUT", { last_played: new Date().toISOString() });
       } catch (e) {
-        console.error("[DEBUG] Looping message TTS failed:", e.message);
+        console.error("[DEBUG] Looping message processing failed:", e.message);
       }
     }
   } catch (e) {
