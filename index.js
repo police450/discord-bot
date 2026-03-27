@@ -157,51 +157,55 @@ client.on("interactionCreate", async (interaction) => {
     }
 
     await interaction.deferReply({ ephemeral: true });
-    let retries = 3;
-    let connected = false;
 
-    while (retries > 0 && !connected) {
-      try {
-        console.log(`[DEBUG] Attempting connection (retry ${4 - retries}/3)...`);
-        guildState.connection = joinVoiceChannel({
-          channelId: channel.id,
-          guildId: channel.guild.id,
-          adapterCreator: channel.guild.voiceAdapterCreator,
-          selfDeaf: false,
-          selfMute: false,
-        });
+    try {
+      console.log(`[DEBUG] Connecting to voice channel: ${channel.name}`);
+      guildState.connection = joinVoiceChannel({
+        channelId: channel.id,
+        guildId: channel.guild.id,
+        adapterCreator: channel.guild.voiceAdapterCreator,
+        selfDeaf: false,
+        selfMute: false,
+      });
 
-        const readyPromise = Promise.race([
-          entersState(guildState.connection, VoiceConnectionStatus.Ready, 15_000),
-          new Promise((_, reject) => setTimeout(() => reject(new Error("Connection timeout after 15s")), 16_000))
-        ]);
-
-        await readyPromise;
-        guildState.connection.subscribe(guildState.audioPlayer);
-        connected = true;
-
-        console.log(`[DEBUG] ✅ Voice connection established`);
-        await interaction.editReply(`✅ Joined ${channel.name}! Listening...`);
-        await log("success", "bot_join", `Joined ${channel.name}`, { channel: channel.name, guild_id: guildId });
-        startListening(guildState, channel);
-
-      } catch (err) {
-        retries--;
-        console.error(`[DEBUG] Connection error: ${err.message}`);
-        try { guildState.connection?.destroy(); } catch {}
-        guildState.connection = null;
-
-        if (retries === 0) {
-          await interaction.editReply(`❌ Cannot connect to voice after 3 attempts.
-• Check bot has **Connect** & **Speak** perms
-• Verify firewall allows UDP
-• Ensure intents are enabled in Discord Dev Portal`);
-          await log("error", "error", `Failed to join: ${err.message}`, { guild_id: guildId });
-        } else {
-          console.log(`[DEBUG] Retrying in 3 seconds...`);
-          await new Promise(resolve => setTimeout(resolve, 3000));
+      // Handle disconnects — auto-reconnect
+      guildState.connection.on(VoiceConnectionStatus.Disconnected, async () => {
+        console.log("[DEBUG] Disconnected — attempting reconnect...");
+        try {
+          await Promise.race([
+            entersState(guildState.connection, VoiceConnectionStatus.Signalling, 5_000),
+            entersState(guildState.connection, VoiceConnectionStatus.Connecting, 5_000),
+          ]);
+          // Seems to be reconnecting, wait for Ready
+          await entersState(guildState.connection, VoiceConnectionStatus.Ready, 20_000);
+          console.log("[DEBUG] Reconnected ✅");
+        } catch {
+          console.log("[DEBUG] Reconnect failed — destroying connection");
+          guildState.connection.destroy();
+          guildState.connection = null;
         }
-      }
+      });
+
+      // Don't wait for Ready — Discord voice on Railway often stays in
+      // "signalling" due to UDP NAT traversal. Subscribe immediately and
+      // start listening — the connection will become Ready once UDP is punched.
+      guildState.connection.subscribe(guildState.audioPlayer);
+
+      // Give it a moment then start listening regardless of state
+      await new Promise(resolve => setTimeout(resolve, 2000));
+      const state = guildState.connection.state.status;
+      console.log(`[DEBUG] Connection state after 2s: ${state}`);
+
+      await interaction.editReply(`✅ Joined ${channel.name}! (State: ${state}) — listening for voice...`);
+      await log("success", "bot_join", `Joined ${channel.name} (state: ${state})`, { channel: channel.name, guild_id: guildId });
+      startListening(guildState, channel);
+
+    } catch (err) {
+      console.error(`[DEBUG] Connection error: ${err.message}`);
+      try { guildState.connection?.destroy(); } catch {}
+      guildState.connection = null;
+      await interaction.editReply(`❌ Failed to join voice: ${err.message}`);
+      await log("error", "error", `Failed to join: ${err.message}`, { guild_id: guildId });
     }
   }
 
@@ -247,6 +251,31 @@ function startListening(guildState, channel) {
   const receiver = guildState.connection.receiver;
   console.log(`[DEBUG] ✅ startListening: Opus→ffmpeg pipeline for ${channel.name}`);
 
+  // Wait for Ready state before attaching speaking listener
+  // On Railway, connection starts in signalling; UDP punch-through happens async
+  const attachSpeaking = () => {
+    const status = guildState.connection?.state?.status;
+    console.log(`[DEBUG] Connection status when attaching speaking listener: ${status}`);
+    attachSpeakingListener(guildState, channel, receiver);
+  };
+
+  if (guildState.connection.state.status === VoiceConnectionStatus.Ready) {
+    attachSpeaking();
+  } else {
+    entersState(guildState.connection, VoiceConnectionStatus.Ready, 60_000)
+      .then(() => {
+        console.log("[DEBUG] Connection became Ready — attaching speaking listener");
+        attachSpeaking();
+      })
+      .catch((err) => {
+        console.error(`[DEBUG] Connection never became Ready: ${err.message}`);
+        // Attach anyway — some partial voice data may still flow
+        attachSpeaking();
+      });
+  }
+}
+
+function attachSpeakingListener(guildState, channel, receiver) {
   receiver.speaking.on("start", (userId) => {
     if (guildState.isMuted) return;
     if (processingUsers.has(userId)) return;
@@ -316,6 +345,11 @@ function startListening(guildState, channel) {
   });
 
   console.log(`[DEBUG] receiver.speaking listener attached ✅`);
+  
+  // Re-attach if connection drops and reconnects
+  guildState.connection.on(VoiceConnectionStatus.Ready, () => {
+    console.log("[DEBUG] Connection re-entered Ready — speaking listener already active");
+  });
 }
 
 async function processAudio(guildState, wavPath, userId, username, channelName, startMs) {
