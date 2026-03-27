@@ -1,0 +1,12 @@
+app = "discord-voice-bot"
+primary_region = "lhr"
+
+[build]
+
+[env]
+NODE_ENV = "production"
+
+[[vm]]
+memory = "512mb"
+cpu_kind = "shared"
+cpus = 1
