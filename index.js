@@ -2,12 +2,13 @@ require("dotenv").config();
 const sodium = require("libsodium-wrappers");
 const { Client, GatewayIntentBits } = require("discord.js");
 const { joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus, EndBehaviorType, VoiceConnectionStatus, entersState, getVoiceConnection } = require("@discordjs/voice");
-const OpusScript = require("opusscript");
+const prism = require("prism-media");
 const OpenAI = require("openai");
 const { ElevenLabsClient } = require("@elevenlabs/elevenlabs-js");
 const { execSync } = require("child_process");
 const ffmpegPath = require("ffmpeg-static");
 const fs = require("fs");
+const { pipeline } = require("stream/promises");
 const path = require("path");
 
 const DASHBOARD_API_URL = process.env.DASHBOARD_API_URL;
@@ -240,177 +241,104 @@ client.on("interactionCreate", async (interaction) => {
   }
 });
 
-// ✅ Rate limiting & caching for transcription
-const transcriptionCache = new Map();
-const rateLimiter = new Map();
-const speakingUsers = new Map();
-
-function isRateLimited(userId) {
-  const lastCall = rateLimiter.get(userId) || 0;
-  const now = Date.now();
-  if (now - lastCall < 500) return true;
-  rateLimiter.set(userId, now);
-  return false;
-}
-
-function cacheKey(data) {
-  return require("crypto").createHash("md5").update(JSON.stringify(data)).digest("hex");
-}
+// ✅ Correct approach: use receiver.speaking events (like Lotthar/voice-to-gpt)
+const processingUsers = new Set();
 
 function startListening(guildState, channel) {
   const receiver = guildState.connection.receiver;
-  const userState = guildState.userState;
-  console.log(`[DEBUG] startListening: Receiver ready for ${channel.name}`);
+  console.log(`[DEBUG] ✅ startListening: Using receiver.speaking events for ${channel.name}`);
 
-  function flushAndProcess(userId) {
-    const state = userState[userId];
-    if (!state?.hasAudio || !state.opusChunks.length) return;
+  // When user STARTS speaking — subscribe to their audio stream with AfterSilence
+  receiver.speaking.on("start", (userId) => {
+    if (guildState.isMuted) return;
+    if (processingUsers.has(userId)) return; // already collecting audio for this user
 
-    const { opusChunks, utteranceStart, username } = state;
-    const duration = Date.now() - utteranceStart;
-
-    state.opusChunks = [];
-    state.hasAudio = false;
-    state.utteranceStart = null;
-
-    if (duration < MIN_AUDIO_MS) {
-      console.log(`[DEBUG] Audio too short (${duration}ms < ${MIN_AUDIO_MS}ms), skipping`);
-      return;
-    }
-
-    // ✅ Rate limiting check
-    if (isRateLimited(userId)) {
-      console.log(`[DEBUG] Rate limit: ${username} speaking too frequently, buffering next utterance`);
-      return;
-    }
-
-    console.log(`[DEBUG] Flushing ${username}: ${opusChunks.length} packets, ${duration}ms`);
-    log("info", "speaking_end", `${username} stopped speaking`, { username, user_id: userId, duration_ms: duration });
-    
-    // Track speaker stats
-    const speakerData = speakingUsers.get(userId) || { username, totalSpeakTime: 0, utterances: 0 };
-    speakerData.totalSpeakTime += duration;
-    speakerData.utterances += 1;
-    speakerData.lastSpoke = Date.now();
-    speakingUsers.set(userId, speakerData);
-
-    processAudio(guildState, opusChunks, userId, username, channel.name, utteranceStart);
-  }
-
-  function subscribeUser(userId) {
-    if (userState[userId]) return;
     const user = client.users.cache.get(userId);
     const username = user?.username || userId;
+    console.log(`[DEBUG] 🎙️ ${username} started speaking`);
+    log("info", "speaking_start", `${username} started speaking`, { user_id: userId, username });
 
-    console.log(`[DEBUG] Subscribing to: ${username}`);
-    const opusStream = receiver.subscribe(userId, { end: { behavior: EndBehaviorType.Manual } });
-    userState[userId] = { 
-      stream: opusStream, 
-      opusChunks: [], 
-      silenceTimer: null, 
-      utteranceStart: null, 
-      hasAudio: false, 
-      username,
-      packetCount: 0 
-    };
+    // Interrupt bot if it's speaking
+    if (guildState.isSpeaking) {
+      guildState.audioPlayer.stop();
+      guildState.isSpeaking = false;
+      log("warning", "interrupt", `Bot interrupted by ${username}`);
+    }
 
-    opusStream.on("data", (packet) => {
-      const state = userState[userId];
-      if (!state) return;
+    const utteranceStart = Date.now();
 
-      if (!packet || packet.length === 0) return;
+    // Subscribe with AfterSilence — stream auto-closes after SILENCE_TIMEOUT_MS of quiet
+    const opusStream = receiver.subscribe(userId, {
+      end: { behavior: EndBehaviorType.AfterSilence, duration: SILENCE_TIMEOUT_MS },
+    });
 
-      state.packetCount++;
+    // Decode Opus → PCM using prism-media (same library @discordjs/voice uses internally)
+    const decoder = new prism.opus.Decoder({ frameSize: 960, channels: 2, rate: 48000 });
+    const pcmChunks = [];
 
-      if (!state.hasAudio) {
-        state.hasAudio = true;
-        state.utteranceStart = Date.now();
-        console.log(`[DEBUG] 🎙️ ${username} started speaking (packet ${state.packetCount})`);
-        log("info", "speaking_start", `${username} started speaking`, { user_id: userId, username });
-        if (guildState.isSpeaking) {
-          guildState.audioPlayer.stop();
-          guildState.isSpeaking = false;
-        }
+    opusStream.pipe(decoder);
+
+    decoder.on("data", (chunk) => {
+      pcmChunks.push(chunk);
+    });
+
+    decoder.on("end", async () => {
+      processingUsers.delete(userId);
+      const duration = Date.now() - utteranceStart;
+      console.log(`[DEBUG] ${username} done speaking — ${duration}ms, ${pcmChunks.length} PCM chunks`);
+      log("info", "speaking_end", `${username} stopped speaking`, { username, user_id: userId, duration_ms: duration });
+
+      if (duration < MIN_AUDIO_MS || pcmChunks.length === 0) {
+        console.log(`[DEBUG] Audio too short (${duration}ms), skipping`);
+        return;
       }
 
-      state.opusChunks.push(packet);
-      if (state.silenceTimer) clearTimeout(state.silenceTimer);
-      state.silenceTimer = setTimeout(() => flushAndProcess(userId), SILENCE_TIMEOUT_MS);
+      const pcmBuffer = Buffer.concat(pcmChunks);
+      await processAudio(guildState, pcmBuffer, userId, username, channel.name, utteranceStart);
+    });
+
+    decoder.on("error", (err) => {
+      processingUsers.delete(userId);
+      console.error(`[DEBUG] Decoder error for ${username}: ${err.message}`);
     });
 
     opusStream.on("error", (err) => {
-      console.error(`[DEBUG] Stream error for ${username}: ${err.message}`);
-      delete userState[userId];
+      processingUsers.delete(userId);
+      console.error(`[DEBUG] Opus stream error for ${username}: ${err.message}`);
     });
 
-    opusStream.on("close", () => {
-      const state = userState[userId];
-      if (state?.silenceTimer) clearTimeout(state.silenceTimer);
-      delete userState[userId];
-      console.log(`[DEBUG] Stream closed for ${username} (${state?.packetCount || 0} packets received)`);
-    });
-  }
-
-  // Subscribe all current non-bot members
-  const initialMembers = channel.members.filter(m => !m.user.bot);
-  console.log(`[DEBUG] Pre-subscribing ${initialMembers.size} members...`);
-  initialMembers.forEach(m => {
-    subscribeUser(m.id);
+    processingUsers.add(userId);
   });
 
-  // Handle members joining/leaving
-  client.on("voiceStateUpdate", (oldState, newState) => {
-    if (newState.member?.user.bot) return;
-    const joinedChannel = newState.channelId === channel.id && oldState.channelId !== channel.id;
-    const leftChannel = oldState.channelId === channel.id && newState.channelId !== channel.id;
-    if (joinedChannel) {
-      console.log(`[DEBUG] ${newState.member?.user.username} joined`);
-      subscribeUser(newState.id);
-    } else if (leftChannel) {
-      const userData = speakingUsers.get(oldState.id);
-      if (userData) {
-        console.log(`[DEBUG] ${userData.username} left (spoke ${userData.utterances}x, total ${userData.totalSpeakTime}ms)`);
-      }
-      if (userState[oldState.id]?.silenceTimer) clearTimeout(userState[oldState.id].silenceTimer);
-      delete userState[oldState.id];
-    }
-  });
+  console.log(`[DEBUG] receiver.speaking listener attached ✅`);
 }
 
-async function processAudio(guildState, opusChunks, userId, username, channelName, startMs) {
+async function processAudio(guildState, pcmBuffer, userId, username, channelName, startMs) {
+  // pcmBuffer is already decoded PCM (s16le, 48000Hz, 2ch) from prism-media
   const rawPath = path.join("/tmp", `raw_${userId}_${Date.now()}.pcm`);
   const wavPath = path.join("/tmp", `audio_${userId}_${Date.now()}.wav`);
   const mp3Path = path.join("/tmp", `tts_${Date.now()}.mp3`);
 
   try {
-    // Write & decode audio
-    const pcmBuffer = Buffer.concat(opusChunks.map(p => Buffer.from(p)));
+    // Write decoded PCM and convert to 16kHz mono WAV for Whisper
     fs.writeFileSync(rawPath, pcmBuffer);
-    console.log(`[DEBUG] Opus: ${opusChunks.length} packets (${pcmBuffer.length} bytes) → decoding`);
+    console.log(`[DEBUG] PCM buffer: ${pcmBuffer.length} bytes → converting to WAV`);
     
-    execSync(`"${ffmpegPath}" -f s16le -ar 48000 -ac 2 -i "${rawPath}" -ar 16000 -ac 1 "${wavPath}" -y 2>/dev/null`, { stdio: "pipe" });
+    // Input: s16le stereo 48kHz (Discord format), Output: 16kHz mono WAV (Whisper format)
+    execSync(`"${ffmpegPath}" -f s16le -ar 48000 -ac 2 -i "${rawPath}" -ar 16000 -ac 1 -f wav "${wavPath}" -y`, { stdio: "pipe" });
     fs.unlinkSync(rawPath);
 
-    // Check cache for transcription
-    const audioHash = cacheKey(pcmBuffer);
-    let userText = transcriptionCache.get(audioHash);
-    
+    console.log("[DEBUG] Transcribing with Whisper...");
+    const transcription = await openai.audio.transcriptions.create({ 
+      file: fs.createReadStream(wavPath), 
+      model: process.env.STT_MODEL || "whisper-1"
+    });
+    const userText = transcription.text?.trim();
     if (!userText) {
-      console.log("[DEBUG] Transcribing with Whisper...");
-      const transcription = await openai.audio.transcriptions.create({ 
-        file: fs.createReadStream(wavPath), 
-        model: "whisper-1" 
-      });
-      userText = transcription.text?.trim();
-      if (!userText) {
-        console.log("[DEBUG] Whisper returned empty result");
-        return;
-      }
-      transcriptionCache.set(audioHash, userText);
-      console.log(`[DEBUG] Cached: "${userText.substring(0, 50)}..."`);
-    } else {
-      console.log("[DEBUG] Cache hit!");
+      console.log("[DEBUG] Whisper returned empty/silent result, skipping");
+      return;
     }
+    console.log(`[DEBUG] STT: "${userText}"`);
 
     log("success", "stt_output", `STT: ${userText}`, { username, user_id: userId });
 
