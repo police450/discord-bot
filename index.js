@@ -1,3 +1,11 @@
+// Catch ALL unhandled errors at the very top — before any other code
+process.on("unhandledRejection", (err) => {
+  console.error("[DEBUG] Unhandled rejection (caught):", err?.message || err);
+});
+process.on("uncaughtException", (err) => {
+  console.error("[DEBUG] Uncaught exception (caught):", err?.message || err);
+});
+
 require("dotenv").config();
 const sodium = require("libsodium-wrappers");
 const { Client, GatewayIntentBits } = require("discord.js");
@@ -178,11 +186,14 @@ client.on("interactionCreate", async (interaction) => {
         return;
       }
 
+      // Wrap deferReply — if interaction already handled by another instance, skip
+      let deferred = false;
       try {
         await interaction.deferReply({ flags: 64 });
+        deferred = true;
       } catch (e) {
-        console.error("[DEBUG] deferReply failed (interaction expired):", e.message);
-        return;
+        console.error("[DEBUG] deferReply failed (likely duplicate instance):", e.message);
+        return; // Another machine already handled this interaction
       }
 
       try {
@@ -555,15 +566,6 @@ setInterval(() => {
     }
   });
 }, 30000);
-
-// Catch ALL unhandled promise rejections — prevent any crash
-process.on("unhandledRejection", (err) => {
-  console.error("[DEBUG] Unhandled rejection (caught):", err?.message || err);
-});
-
-process.on("uncaughtException", (err) => {
-  console.error("[DEBUG] Uncaught exception (caught):", err?.message || err);
-});
 
 // Start HTTP health server FIRST — before anything else so Fly.io health checks pass immediately
 const http = require("http");
