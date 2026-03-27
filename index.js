@@ -214,44 +214,6 @@ client.on("interactionCreate", async (interaction) => {
           console.log(`[DEBUG] Using FLY_PUBLIC_IP: ${publicIp}`);
         }
 
-        // Patch dgram.createSocket BEFORE joinVoiceChannel so we intercept the UDP socket
-        // at creation time. This rewrites Discord's IP discovery response (which reports the
-        // internal NAT IP) with our real public IP, fixing UdpHandshakeFailed (state 6) on Fly.io.
-        if (publicIp) {
-          const dgram = require("dgram");
-          const origCreate = dgram.createSocket.bind(dgram);
-          dgram.createSocket = function(...args) {
-            const sock = origCreate(...args);
-            const origEmit = sock.emit.bind(sock);
-            sock.emit = function(event, ...eArgs) {
-              if (event === "message" && Buffer.isBuffer(eArgs[0])) {
-                const msg = eArgs[0];
-                // IP discovery response: type=0x0002 at bytes 0-1, length 74
-                if (msg.length === 74 && msg.readUInt16BE(0) === 2) {
-                  const buf = Buffer.from(msg);
-                  const nullIdx = buf.indexOf(0, 8);
-                  const end = nullIdx > 8 ? nullIdx : 72;
-                  const reportedIp = buf.slice(8, end).toString("ascii");
-                  if (reportedIp && reportedIp !== publicIp) {
-                    console.log(`[DEBUG] ✅ IP discovery patch: ${reportedIp} → ${publicIp}`);
-                    buf.fill(0, 8, 72);
-                    buf.write(publicIp, 8, "ascii");
-                    return origEmit(event, buf, ...eArgs.slice(1));
-                  } else {
-                    console.log(`[DEBUG] IP discovery: reported ${reportedIp} matches public IP, no rewrite needed`);
-                  }
-                }
-              }
-              return origEmit(event, ...eArgs);
-            };
-            console.log(`[DEBUG] dgram socket created and patched for IP rewrite`);
-            // Only patch the first socket (the voice UDP one) — restore after
-            dgram.createSocket = origCreate;
-            return sock;
-          };
-          console.log(`[DEBUG] dgram.createSocket monkey-patched, public IP: ${publicIp}`);
-        }
-
         guildState.connection = joinVoiceChannel({
           channelId: channel.id,
           guildId: channel.guild.id,
@@ -261,14 +223,67 @@ client.on("interactionCreate", async (interaction) => {
           debug: true,
         });
 
-        // Log all state transitions for debugging
+        // Intercept at the networking level — hook onUdpDebug to see all UDP traffic
+        // and patch the socket via the networking object's onUdpDebug handler
         guildState.connection.on("stateChange", (oldState, newState) => {
           console.log(`[DEBUG] Voice state: ${oldState.status} → ${newState.status}`);
-          if (newState.status === VoiceConnectionStatus.Connecting || newState.status === VoiceConnectionStatus.Signalling) {
-            const networking = newState.networking;
-            if (networking) {
-              console.log(`[DEBUG] Networking state: ${JSON.stringify(networking.state?.code)}`);
+          const networking = newState?.networking;
+          if (!networking) return;
+          const code = networking.state?.code ?? networking._state?.code;
+          console.log(`[DEBUG] Networking code: ${code}`);
+
+          // Override onUdpDebug to spy on all UDP messages
+          networking.onUdpDebug = (msg) => {
+            console.log(`[DEBUG] UDP: ${msg}`);
+          };
+
+          // Try to find the UDP socket through all possible paths
+          const findAndPatchSocket = (obj, depth, path) => {
+            if (depth > 4 || !obj || typeof obj !== "object") return false;
+            // Look for a dgram socket (has send, bind, address methods)
+            if (typeof obj.send === "function" && typeof obj.bind === "function" && typeof obj.address === "function") {
+              if (obj._ipPatched) return true;
+              obj._ipPatched = true;
+              console.log(`[DEBUG] ✅ Found UDP socket at: ${path}`);
+              try { console.log(`[DEBUG] Socket address: ${JSON.stringify(obj.address())}`); } catch(e) {}
+              const origEmit = obj.emit.bind(obj);
+              obj.emit = (event, ...args) => {
+                if (event === "message" && Buffer.isBuffer(args[0]) && args[0].length === 74) {
+                  const buf = Buffer.from(args[0]);
+                  if (buf.readUInt16BE(0) === 2) {
+                    const nullIdx = buf.indexOf(0, 8);
+                    const reportedIp = buf.slice(8, nullIdx > 8 ? nullIdx : 72).toString("ascii").replace(/ /g, "");
+                    console.log(`[DEBUG] IP discovery response: reportedIp=${reportedIp}, publicIp=${publicIp}`);
+                    if (publicIp && reportedIp && reportedIp !== publicIp) {
+                      buf.fill(0, 8, 72);
+                      buf.write(publicIp, 8, "ascii");
+                      console.log(`[DEBUG] ✅ Rewrote IP: ${reportedIp} → ${publicIp}`);
+                      return origEmit(event, buf, ...args.slice(1));
+                    }
+                  }
+                }
+                return origEmit(event, ...args);
+              };
+              return true;
             }
+            for (const key of Object.keys(obj)) {
+              try {
+                if (findAndPatchSocket(obj[key], depth + 1, `${path}.${key}`)) return true;
+              } catch(e) {}
+            }
+            return false;
+          };
+
+          // Try patching immediately and after a short delay
+          const tryPatch = () => {
+            const found = findAndPatchSocket(networking, 0, "networking");
+            if (!found) console.log(`[DEBUG] Socket not found at this state, will retry`);
+            return found;
+          };
+
+          if (!tryPatch()) {
+            setTimeout(tryPatch, 100);
+            setTimeout(tryPatch, 300);
           }
         });
 
