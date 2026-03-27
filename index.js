@@ -227,6 +227,22 @@ client.on("interactionCreate", async (interaction) => {
           }
         });
 
+        // If stuck in signalling for >60s, destroy and let user rejoin
+        // This happens when Fly.io doesn't have a dedicated IPv4 for Discord UDP
+        let readyTimeout = setTimeout(() => {
+          if (guildState.connection?.state?.status === VoiceConnectionStatus.Signalling ||
+              guildState.connection?.state?.status === VoiceConnectionStatus.Connecting) {
+            console.log("[DEBUG] ⚠️ Voice stuck in signalling after 60s — destroying. Ensure flyctl ips allocate-v4 has been run.");
+            guildState.connection.destroy();
+            guildState.connection = null;
+          }
+        }, 60_000);
+
+        guildState.connection.once(VoiceConnectionStatus.Ready, () => {
+          clearTimeout(readyTimeout);
+          console.log("[DEBUG] ✅ Voice connection Ready — UDP established!");
+        });
+
         guildState.connection.subscribe(guildState.audioPlayer);
 
         try { await interaction.editReply(`✅ Joined ${channel.name}! Waiting for voice connection...`); } catch {}
