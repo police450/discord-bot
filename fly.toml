@@ -17,3 +17,7 @@ NODE_ENV = "production"
 memory = "1gb"
 cpu_kind = "shared"
 cpus = 1
+
+# Allocate a dedicated public IPv4 so Discord UDP voice traffic can reach this machine
+# Run after first deploy: flyctl ips allocate-v4 -a <app-name>
+# Then: flyctl scale count 1 -a <app-name>  (only 1 machine needed)
