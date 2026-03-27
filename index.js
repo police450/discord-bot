@@ -229,60 +229,31 @@ client.on("interactionCreate", async (interaction) => {
         // Without this, Fly.io NAT causes the bot to report the wrong IP back to Discord,
         // causing the handshake to fail (Networking state 6 = UdpHandshakeFailed).
         if (publicIp) {
-          const patchConnection = () => {
+          // Dump the full networking internals so we can find the UDP socket path
+          guildState.connection.on("stateChange", (_old, newState) => {
             try {
-              const state = guildState.connection?.state;
-              const networking = state?.networking;
-              if (!networking) return;
-
-              const netState = networking.state;
-              const udp = netState?.udp;
-              if (!udp?.socket) return;
-
-              const socket = udp.socket;
-              if (socket._ipPatched) return;
-              socket._ipPatched = true;
-
-              const origEmit = socket.emit.bind(socket);
-              socket.emit = (event, ...args) => {
-                // IP discovery response is a UDP "message" event with a 74-byte packet
-                if (event === "message" && Buffer.isBuffer(args[0]) && args[0].length === 74) {
-                  const buf = Buffer.from(args[0]); // copy so we can mutate
-                  // Bytes 8–71 contain the null-terminated IP string in the discovery response
-                  const nullIdx = buf.indexOf(0, 8);
-                  const reportedIp = buf.slice(8, nullIdx).toString("ascii");
-                  if (reportedIp !== publicIp) {
-                    console.log(`[DEBUG] IP discovery: Discord sees ${reportedIp}, overriding with ${publicIp}`);
-                    buf.fill(0, 8, 72); // clear IP field
-                    buf.write(publicIp, 8, "ascii");
-                    return origEmit(event, buf, ...args.slice(1));
+              const networking = newState?.networking;
+              if (!networking) {
+                console.log(`[DEBUG] No networking object in state: ${newState.status}`);
+                return;
+              }
+              // Log all top-level keys on networking and networking.state
+              console.log(`[DEBUG] networking keys: ${Object.keys(networking).join(", ")}`);
+              if (networking.state) {
+                console.log(`[DEBUG] networking.state keys: ${Object.keys(networking.state).join(", ")}`);
+                // Log one level deeper for each key
+                for (const k of Object.keys(networking.state)) {
+                  const v = networking.state[k];
+                  if (v && typeof v === "object") {
+                    console.log(`[DEBUG] networking.state.${k} keys: ${Object.keys(v).join(", ")}`);
+                  } else {
+                    console.log(`[DEBUG] networking.state.${k} = ${v}`);
                   }
                 }
-                return origEmit(event, ...args);
-              };
-              console.log(`[DEBUG] ✅ IP discovery patch applied (public IP: ${publicIp})`);
-            } catch (e) {
-              console.error("[DEBUG] IP patch failed:", e.message);
-            }
-          };
-
-          // Patch on every state change — UDP socket may not exist immediately on Connecting
-          guildState.connection.on("stateChange", (_old, newState) => {
-            console.log(`[DEBUG] Trying IP patch in state: ${newState.status}`);
-            // Poll for up to 2 seconds waiting for UDP socket to appear
-            let attempts = 0;
-            const poll = setInterval(() => {
-              patchConnection();
-              attempts++;
-              const patched = guildState.connection?.state?.networking?.state?.udp?.socket?._ipPatched;
-              if (patched) {
-                console.log(`[DEBUG] IP patch confirmed active after ${attempts} attempts`);
-                clearInterval(poll);
-              } else if (attempts > 20) {
-                console.log(`[DEBUG] IP patch not applied after ${attempts} attempts (UDP socket may not exist in this state)`);
-                clearInterval(poll);
               }
-            }, 100);
+            } catch (e) {
+              console.error("[DEBUG] Networking dump failed:", e.message);
+            }
           });
         }
 
