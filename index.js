@@ -14,17 +14,18 @@ const DASHBOARD_API_KEY = process.env.DASHBOARD_API_KEY;
 const SILENCE_TIMEOUT_MS = parseInt(process.env.SILENCE_TIMEOUT_MS || "1500");
 const MIN_AUDIO_MS = parseInt(process.env.MIN_AUDIO_MS || "300");
 
-let openai = null;
-let elevenlabs = null;
+// Lazy-init API clients so missing env vars don't crash at startup
+let _openai = null;
+let _elevenlabs = null;
 
 function getOpenAI() {
-  if (!openai) openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-  return openai;
+  if (!_openai) _openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+  return _openai;
 }
 
 function getElevenLabs() {
-  if (!elevenlabs) elevenlabs = new ElevenLabsClient({ apiKey: process.env.ELEVENLABS_API_KEY });
-  return elevenlabs;
+  if (!_elevenlabs) _elevenlabs = new ElevenLabsClient({ apiKey: process.env.ELEVENLABS_API_KEY });
+  return _elevenlabs;
 }
 
 // ✅ FIX: Enable ALL required intents including GUILD_VOICE_STATES
@@ -564,6 +565,16 @@ process.on("uncaughtException", (err) => {
   console.error("[DEBUG] Uncaught exception (caught):", err?.message || err);
 });
 
+// Start HTTP health server FIRST — before anything else so Fly.io health checks pass immediately
+const http = require("http");
+const PORT = process.env.PORT || 8080;
+http.createServer((req, res) => {
+  res.writeHead(200);
+  res.end("OK");
+}).listen(PORT, "0.0.0.0", () => {
+  console.log(`[DEBUG] Health server listening on 0.0.0.0:${PORT}`);
+});
+
 async function startBot() {
   try {
     await sodium.ready;
@@ -576,13 +587,3 @@ async function startBot() {
 }
 
 startBot();
-
-// Fly.io requires a process to bind to PORT — add a minimal HTTP health server
-const http = require("http");
-const PORT = process.env.PORT || 8080;
-http.createServer((req, res) => {
-  res.writeHead(200);
-  res.end("OK");
-}).listen(PORT, "0.0.0.0", () => {
-  console.log(`[DEBUG] Health server listening on 0.0.0.0:${PORT}`);
-});
