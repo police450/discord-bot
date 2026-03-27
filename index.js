@@ -1,14 +1,12 @@
 require("dotenv").config();
 const sodium = require("libsodium-wrappers");
 const { Client, GatewayIntentBits } = require("discord.js");
-const { joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus, EndBehaviorType, VoiceConnectionStatus, entersState, getVoiceConnection } = require("@discordjs/voice");
-const prism = require("prism-media");
+const { joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus, EndBehaviorType, VoiceConnectionStatus, entersState } = require("@discordjs/voice");
 const OpenAI = require("openai");
 const { ElevenLabsClient } = require("@elevenlabs/elevenlabs-js");
-const { execSync } = require("child_process");
+const { spawn } = require("child_process");
 const ffmpegPath = require("ffmpeg-static");
 const fs = require("fs");
-const { pipeline } = require("stream/promises");
 const path = require("path");
 
 const DASHBOARD_API_URL = process.env.DASHBOARD_API_URL;
@@ -241,24 +239,23 @@ client.on("interactionCreate", async (interaction) => {
   }
 });
 
-// ✅ Correct approach: use receiver.speaking events (like Lotthar/voice-to-gpt)
+// ✅ Pipe raw Opus stream directly into ffmpeg — no native decoder needed
+// Per Discord voice docs: audio is 48kHz 2ch Opus frames (960 samples = 20ms each)
 const processingUsers = new Set();
 
 function startListening(guildState, channel) {
   const receiver = guildState.connection.receiver;
-  console.log(`[DEBUG] ✅ startListening: Using receiver.speaking events for ${channel.name}`);
+  console.log(`[DEBUG] ✅ startListening: Opus→ffmpeg pipeline for ${channel.name}`);
 
-  // When user STARTS speaking — subscribe to their audio stream with AfterSilence
   receiver.speaking.on("start", (userId) => {
     if (guildState.isMuted) return;
-    if (processingUsers.has(userId)) return; // already collecting audio for this user
+    if (processingUsers.has(userId)) return;
 
     const user = client.users.cache.get(userId);
     const username = user?.username || userId;
     console.log(`[DEBUG] 🎙️ ${username} started speaking`);
     log("info", "speaking_start", `${username} started speaking`, { user_id: userId, username });
 
-    // Interrupt bot if it's speaking
     if (guildState.isSpeaking) {
       guildState.audioPlayer.stop();
       guildState.isSpeaking = false;
@@ -266,69 +263,67 @@ function startListening(guildState, channel) {
     }
 
     const utteranceStart = Date.now();
+    processingUsers.add(userId);
 
-    // Subscribe with AfterSilence — stream auto-closes after SILENCE_TIMEOUT_MS of quiet
+    // Subscribe to Opus stream — closes automatically after silence
     const opusStream = receiver.subscribe(userId, {
       end: { behavior: EndBehaviorType.AfterSilence, duration: SILENCE_TIMEOUT_MS },
     });
 
-    // Decode Opus → PCM using prism-media (same library @discordjs/voice uses internally)
-    const decoder = new prism.opus.Decoder({ frameSize: 960, channels: 2, rate: 48000 });
-    const pcmChunks = [];
+    const wavPath = path.join("/tmp", `audio_${userId}_${Date.now()}.wav`);
 
-    opusStream.pipe(decoder);
+    // Pipe raw Opus packets directly into ffmpeg:
+    // Discord sends containerless Opus frames per the voice docs.
+    // ffmpeg with -f opus reads them correctly and converts to 16kHz mono WAV for Whisper.
+    const ffmpeg = spawn(ffmpegPath, [
+      "-f", "opus",          // Input format: raw Opus frames (as Discord sends per voice spec)
+      "-i", "pipe:0",        // Read from stdin
+      "-ar", "16000",        // Output: 16kHz (Whisper requirement)
+      "-ac", "1",            // Output: mono
+      "-f", "wav",           // Output: WAV container
+      wavPath,
+      "-y"
+    ]);
 
-    decoder.on("data", (chunk) => {
-      pcmChunks.push(chunk);
-    });
-
-    decoder.on("end", async () => {
-      processingUsers.delete(userId);
-      const duration = Date.now() - utteranceStart;
-      console.log(`[DEBUG] ${username} done speaking — ${duration}ms, ${pcmChunks.length} PCM chunks`);
-      log("info", "speaking_end", `${username} stopped speaking`, { username, user_id: userId, duration_ms: duration });
-
-      if (duration < MIN_AUDIO_MS || pcmChunks.length === 0) {
-        console.log(`[DEBUG] Audio too short (${duration}ms), skipping`);
-        return;
-      }
-
-      const pcmBuffer = Buffer.concat(pcmChunks);
-      await processAudio(guildState, pcmBuffer, userId, username, channel.name, utteranceStart);
-    });
-
-    decoder.on("error", (err) => {
-      processingUsers.delete(userId);
-      console.error(`[DEBUG] Decoder error for ${username}: ${err.message}`);
-    });
+    opusStream.pipe(ffmpeg.stdin);
 
     opusStream.on("error", (err) => {
-      processingUsers.delete(userId);
       console.error(`[DEBUG] Opus stream error for ${username}: ${err.message}`);
     });
 
-    processingUsers.add(userId);
+    ffmpeg.stderr.on("data", (d) => {
+      // ffmpeg logs to stderr — only log if looks like an error
+      const msg = d.toString();
+      if (msg.includes("Error") || msg.includes("Invalid")) {
+        console.error(`[FFMPEG ERR] ${msg.trim()}`);
+      }
+    });
+
+    ffmpeg.on("close", async (code) => {
+      processingUsers.delete(userId);
+      const duration = Date.now() - utteranceStart;
+      console.log(`[DEBUG] ${username} done — ffmpeg exited ${code}, ${duration}ms`);
+      log("info", "speaking_end", `${username} stopped speaking`, { username, user_id: userId, duration_ms: duration });
+
+      if (code !== 0 || duration < MIN_AUDIO_MS) {
+        console.log(`[DEBUG] Skipping: ffmpeg code=${code}, duration=${duration}ms`);
+        try { fs.unlinkSync(wavPath); } catch {}
+        return;
+      }
+
+      await processAudio(guildState, wavPath, userId, username, channel.name, utteranceStart);
+    });
   });
 
   console.log(`[DEBUG] receiver.speaking listener attached ✅`);
 }
 
-async function processAudio(guildState, pcmBuffer, userId, username, channelName, startMs) {
-  // pcmBuffer is already decoded PCM (s16le, 48000Hz, 2ch) from prism-media
-  const rawPath = path.join("/tmp", `raw_${userId}_${Date.now()}.pcm`);
-  const wavPath = path.join("/tmp", `audio_${userId}_${Date.now()}.wav`);
+async function processAudio(guildState, wavPath, userId, username, channelName, startMs) {
+  // wavPath is already a 16kHz mono WAV file ready for Whisper (converted by ffmpeg in startListening)
   const mp3Path = path.join("/tmp", `tts_${Date.now()}.mp3`);
 
   try {
-    // Write decoded PCM and convert to 16kHz mono WAV for Whisper
-    fs.writeFileSync(rawPath, pcmBuffer);
-    console.log(`[DEBUG] PCM buffer: ${pcmBuffer.length} bytes → converting to WAV`);
-    
-    // Input: s16le stereo 48kHz (Discord format), Output: 16kHz mono WAV (Whisper format)
-    execSync(`"${ffmpegPath}" -f s16le -ar 48000 -ac 2 -i "${rawPath}" -ar 16000 -ac 1 -f wav "${wavPath}" -y`, { stdio: "pipe" });
-    fs.unlinkSync(rawPath);
-
-    console.log("[DEBUG] Transcribing with Whisper...");
+    console.log(`[DEBUG] Transcribing WAV with Whisper: ${wavPath}`);
     const transcription = await openai.audio.transcriptions.create({ 
       file: fs.createReadStream(wavPath), 
       model: process.env.STT_MODEL || "whisper-1"
@@ -402,8 +397,8 @@ async function processAudio(guildState, pcmBuffer, userId, username, channelName
     log("error", "error", `Process audio failed: ${err.message}`, { username });
     console.error("[DEBUG]", err.message);
   } finally {
-    try { fs.unlinkSync(rawPath); } catch {}
     try { fs.unlinkSync(wavPath); } catch {}
+    try { fs.unlinkSync(mp3Path); } catch {}
   }
 }
 
