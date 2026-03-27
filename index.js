@@ -214,6 +214,44 @@ client.on("interactionCreate", async (interaction) => {
           console.log(`[DEBUG] Using FLY_PUBLIC_IP: ${publicIp}`);
         }
 
+        // Patch dgram.createSocket BEFORE joinVoiceChannel so we intercept the UDP socket
+        // at creation time. This rewrites Discord's IP discovery response (which reports the
+        // internal NAT IP) with our real public IP, fixing UdpHandshakeFailed (state 6) on Fly.io.
+        if (publicIp) {
+          const dgram = require("dgram");
+          const origCreate = dgram.createSocket.bind(dgram);
+          dgram.createSocket = function(...args) {
+            const sock = origCreate(...args);
+            const origEmit = sock.emit.bind(sock);
+            sock.emit = function(event, ...eArgs) {
+              if (event === "message" && Buffer.isBuffer(eArgs[0])) {
+                const msg = eArgs[0];
+                // IP discovery response: type=0x0002 at bytes 0-1, length 74
+                if (msg.length === 74 && msg.readUInt16BE(0) === 2) {
+                  const buf = Buffer.from(msg);
+                  const nullIdx = buf.indexOf(0, 8);
+                  const end = nullIdx > 8 ? nullIdx : 72;
+                  const reportedIp = buf.slice(8, end).toString("ascii");
+                  if (reportedIp && reportedIp !== publicIp) {
+                    console.log(`[DEBUG] ✅ IP discovery patch: ${reportedIp} → ${publicIp}`);
+                    buf.fill(0, 8, 72);
+                    buf.write(publicIp, 8, "ascii");
+                    return origEmit(event, buf, ...eArgs.slice(1));
+                  } else {
+                    console.log(`[DEBUG] IP discovery: reported ${reportedIp} matches public IP, no rewrite needed`);
+                  }
+                }
+              }
+              return origEmit(event, ...eArgs);
+            };
+            console.log(`[DEBUG] dgram socket created and patched for IP rewrite`);
+            // Only patch the first socket (the voice UDP one) — restore after
+            dgram.createSocket = origCreate;
+            return sock;
+          };
+          console.log(`[DEBUG] dgram.createSocket monkey-patched, public IP: ${publicIp}`);
+        }
+
         guildState.connection = joinVoiceChannel({
           channelId: channel.id,
           guildId: channel.guild.id,
@@ -221,74 +259,11 @@ client.on("interactionCreate", async (interaction) => {
           selfDeaf: false,
           selfMute: false,
           debug: true,
-          udpPortRange: [50000, 50000],
         });
-
-        // Patch the UDP socket to intercept Discord's IP discovery RESPONSE
-        // and rewrite the IP with our real public IP before @discordjs/voice reads it.
-        // Without this, Fly.io NAT causes the bot to report the wrong IP back to Discord,
-        // causing the handshake to fail (Networking state 6 = UdpHandshakeFailed).
-        if (publicIp) {
-          // Hook into the networking object's UDP debug handler to find and patch the socket.
-          // The UDP socket lives at networking._state.udp (private field) in @discordjs/voice v0.17.
-          // We patch it as soon as we see code=1 (UdpHandshaking) before code=6 (UdpHandshakeFailed).
-          let udpPatched = false;
-
-          guildState.connection.on("stateChange", (_old, newState) => {
-            if (udpPatched) return;
-            const networking = newState?.networking;
-            if (!networking) return;
-
-            // Poll for the UDP socket on the private _state field
-            let attempts = 0;
-            const poll = setInterval(() => {
-              attempts++;
-              try {
-                const udp = networking._state?.udp;
-                if (udp?.socket && !udpPatched) {
-                  udpPatched = true;
-                  clearInterval(poll);
-
-                  const socket = udp.socket;
-                  console.log(`[DEBUG] ✅ Found UDP socket via _state after ${attempts} attempts`);
-
-                  // Intercept incoming messages — IP discovery response is 74 bytes
-                  // Discord sends back the IP it sees (our NAT IP) — we rewrite it with our real public IP
-                  const origEmit = socket.emit.bind(socket);
-                  socket.emit = (event, ...args) => {
-                    if (event === "message" && Buffer.isBuffer(args[0]) && args[0].length === 74) {
-                      const buf = Buffer.from(args[0]);
-                      const nullIdx = buf.indexOf(0, 8);
-                      const reportedIp = buf.slice(8, nullIdx > 8 ? nullIdx : 72).toString("ascii").replace(/ /g, "");
-                      if (reportedIp && reportedIp !== publicIp) {
-                        console.log(`[DEBUG] IP discovery: Discord reports ${reportedIp}, rewriting to ${publicIp}`);
-                        buf.fill(0, 8, 72);
-                        buf.write(publicIp, 8, "ascii");
-                        return origEmit(event, buf, ...args.slice(1));
-                      }
-                    }
-                    return origEmit(event, ...args);
-                  };
-                } else if (attempts > 30) {
-                  clearInterval(poll);
-                  console.log(`[DEBUG] UDP socket not found in _state after ${attempts} attempts`);
-                  // Log _state keys for further diagnosis
-                  if (networking._state) {
-                    console.log(`[DEBUG] networking._state keys: ${Object.keys(networking._state).join(", ")}`);
-                  }
-                }
-              } catch (e) {
-                clearInterval(poll);
-                console.error("[DEBUG] UDP patch poll error:", e.message);
-              }
-            }, 50);
-          });
-        }
 
         // Log all state transitions for debugging
         guildState.connection.on("stateChange", (oldState, newState) => {
           console.log(`[DEBUG] Voice state: ${oldState.status} → ${newState.status}`);
-          // When we enter the Connecting state, the networking object exists — log its details
           if (newState.status === VoiceConnectionStatus.Connecting || newState.status === VoiceConnectionStatus.Signalling) {
             const networking = newState.networking;
             if (networking) {
