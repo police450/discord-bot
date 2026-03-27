@@ -6,29 +6,19 @@ primary_region = "lhr"
 [env]
 NODE_ENV = "production"
 
-# Use [[services]] NOT [http_service] — http_service routes through Fly's proxy
-# which blocks the direct UDP connection Discord voice requires.
-[[services]]
+[http_service]
   internal_port = 8080
-  protocol = "tcp"
+  force_https = false
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
 
-  [[services.ports]]
-    handlers = ["http"]
-    port = 80
-
-  [[services.ports]]
-    handlers = ["tls", "http"]
-    port = 443
-
-  [services.concurrency]
-    type = "connections"
-    hard_limit = 25
-    soft_limit = 20
-
-  [[services.tcp_checks]]
+  [[http_service.checks]]
     interval = "15s"
-    timeout = "2s"
-    grace_period = "5s"
+    timeout = "5s"
+    grace_period = "30s"
+    method = "GET"
+    path = "/"
 
 [[vm]]
 memory = "1gb"
