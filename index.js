@@ -237,28 +237,46 @@ client.on("interactionCreate", async (interaction) => {
             console.log(`[DEBUG] UDP: ${msg}`);
           };
 
-          // Try to find the UDP socket through all possible paths
+          // Try to find the UDP socket through all possible paths (including non-enumerable)
           const findAndPatchSocket = (obj, depth, path) => {
-            if (depth > 4 || !obj || typeof obj !== "object") return false;
-            // Look for a dgram socket (has send, bind, address methods)
-            if (typeof obj.send === "function" && typeof obj.bind === "function" && typeof obj.address === "function") {
+            if (depth > 6 || !obj || typeof obj !== "object") return false;
+            
+            // Check if this object is a dgram socket
+            if (typeof obj.send === "function" && typeof obj.bind === "function") {
               if (obj._ipPatched) return true;
               obj._ipPatched = true;
               console.log(`[DEBUG] ✅ Found UDP socket at: ${path}`);
-              try { console.log(`[DEBUG] Socket address: ${JSON.stringify(obj.address())}`); } catch(e) {}
+              
+              // Patch send() to intercept outgoing packets
+              const origSend = obj.send.bind(obj);
+              obj.send = (buffer, offset, length, port, host, callback) => {
+                if (publicIp && Buffer.isBuffer(buffer) && buffer.length === 74) {
+                  if (buffer.readUInt16BE(0) === 1) { // IP discovery request
+                    const newBuf = Buffer.alloc(74);
+                    buffer.copy(newBuf);
+                    const nullIdx = newBuf.indexOf(0, 8);
+                    newBuf.fill(0, 8, 72);
+                    newBuf.write(publicIp, 8, "ascii");
+                    console.log(`[DEBUG] ✅ Rewrote outgoing IP discovery to: ${publicIp}`);
+                    return origSend(newBuf, offset, length, port, host, callback);
+                  }
+                }
+                return origSend(buffer, offset, length, port, host, callback);
+              };
+              
+              // Also patch emit for incoming responses
               const origEmit = obj.emit.bind(obj);
               obj.emit = (event, ...args) => {
                 if (event === "message" && Buffer.isBuffer(args[0]) && args[0].length === 74) {
                   const buf = Buffer.from(args[0]);
-                  if (buf.readUInt16BE(0) === 2) {
+                  if (buf.readUInt16BE(0) === 2) { // IP discovery response
                     const nullIdx = buf.indexOf(0, 8);
                     const reportedIp = buf.slice(8, nullIdx > 8 ? nullIdx : 72).toString("ascii").replace(/ /g, "");
                     console.log(`[DEBUG] IP discovery response: reportedIp=${reportedIp}, publicIp=${publicIp}`);
                     if (publicIp && reportedIp && reportedIp !== publicIp) {
                       buf.fill(0, 8, 72);
                       buf.write(publicIp, 8, "ascii");
-                      console.log(`[DEBUG] ✅ Rewrote IP: ${reportedIp} → ${publicIp}`);
-                      return origEmit(event, buf, ...args.slice(1));
+                      console.log(`[DEBUG] ✅ Rewrote response IP: ${reportedIp} → ${publicIp}`);
                     }
                   }
                 }
@@ -266,25 +284,42 @@ client.on("interactionCreate", async (interaction) => {
               };
               return true;
             }
+            
+            // Search all enumerable properties
             for (const key of Object.keys(obj)) {
               try {
                 if (findAndPatchSocket(obj[key], depth + 1, `${path}.${key}`)) return true;
               } catch(e) {}
             }
+            
+            // Search non-enumerable properties
+            try {
+              for (const key of Object.getOwnPropertyNames(obj)) {
+                if (key !== "constructor") {
+                  try {
+                    if (findAndPatchSocket(obj[key], depth + 1, `${path}.${key}`)) return true;
+                  } catch(e) {}
+                }
+              }
+            } catch(e) {}
+            
             return false;
           };
 
-          // Try patching immediately and after a short delay
+          // Try patching with exponential backoff
+          let retries = 0;
           const tryPatch = () => {
             const found = findAndPatchSocket(networking, 0, "networking");
-            if (!found) console.log(`[DEBUG] Socket not found at this state, will retry`);
-            return found;
+            if (!found && retries < 8) {
+              retries++;
+              const delay = Math.min(100 * Math.pow(1.5, retries), 2000);
+              setTimeout(tryPatch, delay);
+            } else if (!found) {
+              console.log(`[DEBUG] ⚠️ Socket not found after retries - will attempt IP rewrite on send/receive`);
+            }
           };
 
-          if (!tryPatch()) {
-            setTimeout(tryPatch, 100);
-            setTimeout(tryPatch, 300);
-          }
+          tryPatch();
         });
 
         // Handle disconnects — auto-reconnect
