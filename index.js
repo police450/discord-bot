@@ -10,8 +10,6 @@ require("dotenv").config();
 const sodium = require("libsodium-wrappers");
 const { Client, GatewayIntentBits } = require("discord.js");
 const { joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus, EndBehaviorType, VoiceConnectionStatus, entersState } = require("@discordjs/voice");
-const OpenAI = require("openai");
-const { ElevenLabsClient } = require("@elevenlabs/elevenlabs-js");
 const { spawn } = require("child_process");
 const ffmpegPath = require("ffmpeg-static");
 const fs = require("fs");
@@ -22,19 +20,7 @@ const DASHBOARD_API_KEY = process.env.DASHBOARD_API_KEY;
 const SILENCE_TIMEOUT_MS = parseInt(process.env.SILENCE_TIMEOUT_MS || "1500");
 const MIN_AUDIO_MS = parseInt(process.env.MIN_AUDIO_MS || "300");
 
-// Lazy-init API clients so missing env vars don't crash at startup
-let _openai = null;
-let _elevenlabs = null;
-
-function getOpenAI() {
-  if (!_openai) _openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-  return _openai;
-}
-
-function getElevenLabs() {
-  if (!_elevenlabs) _elevenlabs = new ElevenLabsClient({ apiKey: process.env.ELEVENLABS_API_KEY });
-  return _elevenlabs;
-}
+// API clients no longer needed — Base44 function handles STT/GPT/TTS
 
 // ✅ FIX: Enable ALL required intents including GUILD_VOICE_STATES
 const client = new Client({
