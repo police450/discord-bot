@@ -218,6 +218,7 @@ client.on("interactionCreate", async (interaction) => {
           selfDeaf: false,
           selfMute: false,
           debug: true,
+          udpPortRange: [50000, 50000],
         });
 
         // Patch the UDP socket to advertise our real public IP to Discord
