@@ -574,3 +574,13 @@ async function startBot() {
 }
 
 startBot();
+
+// Fly.io requires a process to bind to PORT — add a minimal HTTP health server
+const http = require("http");
+const PORT = process.env.PORT || 8080;
+http.createServer((req, res) => {
+  res.writeHead(200);
+  res.end("OK");
+}).listen(PORT, "0.0.0.0", () => {
+  console.log(`[DEBUG] Health server listening on 0.0.0.0:${PORT}`);
+});
