@@ -6,18 +6,31 @@ primary_region = "lhr"
 [env]
 NODE_ENV = "production"
 
-[http_service]
+# Use [[services]] NOT [http_service] — http_service routes through Fly's proxy
+# which blocks the direct UDP connection Discord voice requires.
+[[services]]
   internal_port = 8080
-  force_https = false
-  auto_stop_machines = "off"
-  auto_start_machines = true
-  min_machines_running = 1
+  protocol = "tcp"
+
+  [[services.ports]]
+    handlers = ["http"]
+    port = 80
+
+  [[services.ports]]
+    handlers = ["tls", "http"]
+    port = 443
+
+  [services.concurrency]
+    type = "connections"
+    hard_limit = 25
+    soft_limit = 20
+
+  [[services.tcp_checks]]
+    interval = "15s"
+    timeout = "2s"
+    grace_period = "5s"
 
 [[vm]]
 memory = "1gb"
 cpu_kind = "shared"
 cpus = 1
-
-# Allocate a dedicated public IPv4 so Discord UDP voice traffic can reach this machine
-# Run after first deploy: flyctl ips allocate-v4 -a <app-name>
-# Then: flyctl scale count 1 -a <app-name>  (only 1 machine needed)
