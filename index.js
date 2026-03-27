@@ -204,11 +204,19 @@ client.on("interactionCreate", async (interaction) => {
           adapterCreator: channel.guild.voiceAdapterCreator,
           selfDeaf: false,
           selfMute: false,
+          debug: true,
         });
 
         // Log all state transitions for debugging
         guildState.connection.on("stateChange", (oldState, newState) => {
           console.log(`[DEBUG] Voice state: ${oldState.status} → ${newState.status}`);
+          // When we enter the Connecting state, the networking object exists — log its details
+          if (newState.status === VoiceConnectionStatus.Connecting || newState.status === VoiceConnectionStatus.Signalling) {
+            const networking = newState.networking;
+            if (networking) {
+              console.log(`[DEBUG] Networking state: ${JSON.stringify(networking.state?.code)}`);
+            }
+          }
         });
 
         // Handle disconnects — auto-reconnect
