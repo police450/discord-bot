@@ -14,8 +14,18 @@ const DASHBOARD_API_KEY = process.env.DASHBOARD_API_KEY;
 const SILENCE_TIMEOUT_MS = parseInt(process.env.SILENCE_TIMEOUT_MS || "1500");
 const MIN_AUDIO_MS = parseInt(process.env.MIN_AUDIO_MS || "300");
 
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-const elevenlabs = new ElevenLabsClient({ apiKey: process.env.ELEVENLABS_API_KEY });
+let openai = null;
+let elevenlabs = null;
+
+function getOpenAI() {
+  if (!openai) openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+  return openai;
+}
+
+function getElevenLabs() {
+  if (!elevenlabs) elevenlabs = new ElevenLabsClient({ apiKey: process.env.ELEVENLABS_API_KEY });
+  return elevenlabs;
+}
 
 // ✅ FIX: Enable ALL required intents including GUILD_VOICE_STATES
 const client = new Client({
@@ -118,128 +128,137 @@ client.on("guildCreate", async (guild) => {
   await setupBotRolePermissions(guild);
 });
 
+// Prevent any unhandled errors from crashing the process
+client.on("error", (err) => {
+  console.error("[DEBUG] Discord client error (caught):", err.message);
+});
+
 client.on("interactionCreate", async (interaction) => {
   if (!interaction.isCommand()) return;
 
   const guildId = interaction.guildId;
   const channel = interaction.member?.voice.channel;
 
-  if (interaction.commandName === "join") {
-    if (!channel) {
-      await interaction.reply({ content: "❌ Join a voice channel first!", ephemeral: true });
-      return;
-    }
-
-    // ✅ FIX: Detailed permission diagnostics
-    const botMember = channel.guild.members.me;
-    const botPerms = botMember?.permissionsIn(channel);
-    const guildPerms = botMember?.permissions;
-    
-    console.log(`[DEBUG] Guild: ${channel.guild.name} (${channel.guild.id})`);
-    console.log(`[DEBUG] Channel: ${channel.name} (${channel.id})`);
-    console.log(`[DEBUG] Guild perms: ${guildPerms?.toArray().join(", ") || "NONE"}`);
-    console.log(`[DEBUG] Channel perms: ${botPerms?.toArray().join(", ") || "NONE"}`);
-    console.log(`[DEBUG] Bot role: ${botMember?.roles.highest.name} (position: ${botMember?.roles.highest.position})`);
-
-    if (!botPerms?.has("Connect")) {
-      await interaction.reply({ content: `❌ Missing **Connect** permission in **${ channel.name}**`, ephemeral: true });
-      return;
-    }
-    if (!botPerms?.has("Speak")) {
-      await interaction.reply({ content: `❌ Missing **Speak** permission in **${ channel.name}**`, ephemeral: true });
-      return;
-    }
-
-    const guildState = getGuildState(guildId);
-    if (guildState.connection) {
-      await interaction.reply({ content: "⚠️ Bot already in a voice channel!", ephemeral: true });
-      return;
-    }
-
-    await interaction.deferReply({ ephemeral: true });
-
+  // Helper: safe reply that won't crash if interaction expired
+  const safeReply = async (content) => {
     try {
-      console.log(`[DEBUG] Connecting to voice channel: ${channel.name}`);
-      guildState.connection = joinVoiceChannel({
-        channelId: channel.id,
-        guildId: channel.guild.id,
-        adapterCreator: channel.guild.voiceAdapterCreator,
-        selfDeaf: false,
-        selfMute: false,
-      });
-
-      // Handle disconnects — auto-reconnect
-      guildState.connection.on(VoiceConnectionStatus.Disconnected, async () => {
-        console.log("[DEBUG] Disconnected — attempting reconnect...");
-        try {
-          await Promise.race([
-            entersState(guildState.connection, VoiceConnectionStatus.Signalling, 5_000),
-            entersState(guildState.connection, VoiceConnectionStatus.Connecting, 5_000),
-          ]);
-          // Seems to be reconnecting, wait for Ready
-          await entersState(guildState.connection, VoiceConnectionStatus.Ready, 20_000);
-          console.log("[DEBUG] Reconnected ✅");
-        } catch {
-          console.log("[DEBUG] Reconnect failed — destroying connection");
-          guildState.connection.destroy();
-          guildState.connection = null;
-        }
-      });
-
-      // Don't wait for Ready — Discord voice on Railway often stays in
-      // "signalling" due to UDP NAT traversal. Subscribe immediately and
-      // start listening — the connection will become Ready once UDP is punched.
-      guildState.connection.subscribe(guildState.audioPlayer);
-
-      // Give it a moment then start listening regardless of state
-      await new Promise(resolve => setTimeout(resolve, 2000));
-      const state = guildState.connection.state.status;
-      console.log(`[DEBUG] Connection state after 2s: ${state}`);
-
-      await interaction.editReply(`✅ Joined ${channel.name}! (State: ${state}) — listening for voice...`);
-      await log("success", "bot_join", `Joined ${channel.name} (state: ${state})`, { channel: channel.name, guild_id: guildId });
-      startListening(guildState, channel);
-
-    } catch (err) {
-      console.error(`[DEBUG] Connection error: ${err.message}`);
-      try { guildState.connection?.destroy(); } catch {}
-      guildState.connection = null;
-      await interaction.editReply(`❌ Failed to join voice: ${err.message}`);
-      await log("error", "error", `Failed to join: ${err.message}`, { guild_id: guildId });
+      if (interaction.deferred || interaction.replied) {
+        await interaction.editReply(content);
+      } else {
+        await interaction.reply({ content, flags: 64 });
+      }
+    } catch (e) {
+      console.error("[DEBUG] safeReply failed (interaction expired?):", e.message);
     }
-  }
+  };
 
-  if (interaction.commandName === "mute") {
-    const guildState = getGuildState(guildId);
-    if (!guildState.connection) {
-      await interaction.reply({ content: "❌ Bot not in voice", ephemeral: true });
-      return;
+  try {
+    if (interaction.commandName === "join") {
+      if (!channel) {
+        await safeReply("❌ Join a voice channel first!");
+        return;
+      }
+
+      const botMember = channel.guild.members.me;
+      const botPerms = botMember?.permissionsIn(channel);
+
+      if (!botPerms?.has("Connect")) {
+        await safeReply(`❌ Missing **Connect** permission in **${channel.name}**`);
+        return;
+      }
+      if (!botPerms?.has("Speak")) {
+        await safeReply(`❌ Missing **Speak** permission in **${channel.name}**`);
+        return;
+      }
+
+      const guildState = getGuildState(guildId);
+      if (guildState.connection) {
+        await safeReply("⚠️ Bot already in a voice channel!");
+        return;
+      }
+
+      try {
+        await interaction.deferReply({ flags: 64 });
+      } catch (e) {
+        console.error("[DEBUG] deferReply failed (interaction expired):", e.message);
+        return;
+      }
+
+      try {
+        console.log(`[DEBUG] Connecting to voice channel: ${channel.name}`);
+        guildState.connection = joinVoiceChannel({
+          channelId: channel.id,
+          guildId: channel.guild.id,
+          adapterCreator: channel.guild.voiceAdapterCreator,
+          selfDeaf: false,
+          selfMute: false,
+        });
+
+        // Handle disconnects — auto-reconnect
+        guildState.connection.on(VoiceConnectionStatus.Disconnected, async () => {
+          console.log("[DEBUG] Disconnected — attempting reconnect...");
+          try {
+            await Promise.race([
+              entersState(guildState.connection, VoiceConnectionStatus.Signalling, 5_000),
+              entersState(guildState.connection, VoiceConnectionStatus.Connecting, 5_000),
+            ]);
+            await entersState(guildState.connection, VoiceConnectionStatus.Ready, 20_000);
+            console.log("[DEBUG] Reconnected ✅");
+          } catch {
+            console.log("[DEBUG] Reconnect failed — destroying connection");
+            guildState.connection.destroy();
+            guildState.connection = null;
+          }
+        });
+
+        guildState.connection.subscribe(guildState.audioPlayer);
+
+        await new Promise(resolve => setTimeout(resolve, 2000));
+        const state = guildState.connection.state.status;
+        console.log(`[DEBUG] Connection state after 2s: ${state}`);
+
+        try { await interaction.editReply(`✅ Joined ${channel.name}! (State: ${state}) — listening for voice...`); } catch {}
+        await log("success", "bot_join", `Joined ${channel.name} (state: ${state})`, { channel: channel.name, guild_id: guildId });
+        startListening(guildState, channel);
+
+      } catch (err) {
+        console.error(`[DEBUG] Connection error: ${err.message}`);
+        try { guildState.connection?.destroy(); } catch {}
+        guildState.connection = null;
+        try { await interaction.editReply(`❌ Failed to join voice: ${err.message}`); } catch {}
+        await log("error", "error", `Failed to join: ${err.message}`, { guild_id: guildId });
+      }
     }
-    guildState.isMuted = true;
-    await interaction.reply({ content: "🔇 Bot muted", ephemeral: true });
-  }
 
-  if (interaction.commandName === "unmute") {
-    const guildState = getGuildState(guildId);
-    if (!guildState.connection) {
-      await interaction.reply({ content: "❌ Bot not in voice", ephemeral: true });
-      return;
+    else if (interaction.commandName === "mute") {
+      const guildState = getGuildState(guildId);
+      if (!guildState.connection) { await safeReply("❌ Bot not in voice"); return; }
+      guildState.isMuted = true;
+      await safeReply("🔇 Bot muted");
     }
-    guildState.isMuted = false;
-    await interaction.reply({ content: "🔊 Bot unmuted", ephemeral: true });
-  }
 
-  if (interaction.commandName === "leave") {
-    const guildState = getGuildState(guildId);
-    if (guildState.connection) {
-      guildState.connection.destroy();
-      guildState.connection = null;
-      guildState.userState = {};
+    else if (interaction.commandName === "unmute") {
+      const guildState = getGuildState(guildId);
+      if (!guildState.connection) { await safeReply("❌ Bot not in voice"); return; }
       guildState.isMuted = false;
-      await interaction.reply({ content: "👋 Left voice", ephemeral: true });
-    } else {
-      await interaction.reply({ content: "❌ Not in voice", ephemeral: true });
+      await safeReply("🔊 Bot unmuted");
     }
+
+    else if (interaction.commandName === "leave") {
+      const guildState = getGuildState(guildId);
+      if (guildState.connection) {
+        guildState.connection.destroy();
+        guildState.connection = null;
+        guildState.userState = {};
+        guildState.isMuted = false;
+        await safeReply("👋 Left voice");
+      } else {
+        await safeReply("❌ Not in voice");
+      }
+    }
+
+  } catch (err) {
+    console.error("[DEBUG] interactionCreate error (caught):", err.message);
   }
 });
 
@@ -294,18 +313,18 @@ function attachSpeakingListener(guildState, channel, receiver) {
     const utteranceStart = Date.now();
     processingUsers.add(userId);
 
-    // Subscribe to Opus stream — closes automatically after silence
+    // Subscribe to Opus stream — @discordjs/voice decodes to PCM via prism-media
     const opusStream = receiver.subscribe(userId, {
       end: { behavior: EndBehaviorType.AfterSilence, duration: SILENCE_TIMEOUT_MS },
     });
 
     const wavPath = path.join("/tmp", `audio_${userId}_${Date.now()}.wav`);
 
-    // Pipe raw Opus packets directly into ffmpeg:
-    // Discord sends containerless Opus frames per the voice docs.
-    // ffmpeg with -f opus reads them correctly and converts to 16kHz mono WAV for Whisper.
+    // @discordjs/voice receiver gives decoded PCM: 48kHz, 2ch, signed 16-bit LE
     const ffmpeg = spawn(ffmpegPath, [
-      "-f", "opus",          // Input format: raw Opus frames (as Discord sends per voice spec)
+      "-f", "s16le",         // Input: raw signed 16-bit LE PCM
+      "-ar", "48000",        // Input sample rate: 48kHz (Discord standard)
+      "-ac", "2",            // Input channels: stereo
       "-i", "pipe:0",        // Read from stdin
       "-ar", "16000",        // Output: 16kHz (Whisper requirement)
       "-ac", "1",            // Output: mono
@@ -358,7 +377,7 @@ async function processAudio(guildState, wavPath, userId, username, channelName, 
 
   try {
     console.log(`[DEBUG] Transcribing WAV with Whisper: ${wavPath}`);
-    const transcription = await openai.audio.transcriptions.create({ 
+    const transcription = await getOpenAI().audio.transcriptions.create({ 
       file: fs.createReadStream(wavPath), 
       model: process.env.STT_MODEL || "whisper-1"
     });
@@ -372,7 +391,7 @@ async function processAudio(guildState, wavPath, userId, username, channelName, 
     log("success", "stt_output", `STT: ${userText}`, { username, user_id: userId });
 
     // Get GPT response
-    const gptRes = await openai.chat.completions.create({
+    const gptRes = await getOpenAI().chat.completions.create({
       model: process.env.GPT_MODEL || "gpt-4-mini",
       messages: [
         { role: "system", content: process.env.SYSTEM_PROMPT || "You are a real-time voice assistant. Be concise and friendly." },
@@ -385,7 +404,7 @@ async function processAudio(guildState, wavPath, userId, username, channelName, 
     log("success", "gpt_response", `GPT: ${botReply}`, { username });
 
     // Generate TTS
-    const audioStream = await elevenlabs.textToSpeech.convert(process.env.ELEVENLABS_VOICE_ID || "21m00Tcm4TlvDq8ikWAM", {
+    const audioStream = await getElevenLabs().textToSpeech.convert(process.env.ELEVENLABS_VOICE_ID || "21m00Tcm4TlvDq8ikWAM", {
       model_id: process.env.ELEVENLABS_MODEL || "eleven_turbo_v2_5",
       text: botReply,
       voice_settings: {
@@ -456,7 +475,7 @@ async function checkAndReadAnnouncements(guildState) {
 
       try {
         const mp3Path = path.join("/tmp", `announcement_${Date.now()}.mp3`);
-        const audioStream = await elevenlabs.textToSpeech.convert(process.env.ELEVENLABS_VOICE_ID || "21m00Tcm4TlvDq8ikWAM", {
+        const audioStream = await getElevenLabs().textToSpeech.convert(process.env.ELEVENLABS_VOICE_ID || "21m00Tcm4TlvDq8ikWAM", {
           model_id: process.env.ELEVENLABS_MODEL || "eleven_turbo_v2_5",
           text: `Announcement from the developers: ${ann.message}`,
           voice_settings: {
@@ -516,7 +535,7 @@ async function checkAndPlayLoopingMessages(guildState) {
 
       try {
         const mp3Path = path.join("/tmp", `loop_${Date.now()}.mp3`);
-        const audioStream = await elevenlabs.textToSpeech.convert(process.env.ELEVENLABS_VOICE_ID || "21m00Tcm4TlvDq8ikWAM", {
+        const audioStream = await getElevenLabs().textToSpeech.convert(process.env.ELEVENLABS_VOICE_ID || "21m00Tcm4TlvDq8ikWAM", {
           model_id: process.env.ELEVENLABS_MODEL || "eleven_turbo_v2_5",
           text: msg.message,
           voice_settings: {
