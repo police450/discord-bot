@@ -6,6 +6,7 @@ primary_region = "lhr"
 [env]
 NODE_ENV = "production"
 
+# HTTP health check service
 [http_service]
   internal_port = 8080
   force_https = false
@@ -19,6 +20,15 @@ NODE_ENV = "production"
     grace_period = "30s"
     method = "GET"
     path = "/"
+
+# UDP service for Discord voice (ports 1024-65535 outbound UDP must be open)
+# Discord voice servers use UDP on dynamic ports — we need outbound UDP unrestricted
+[[services]]
+  protocol = "udp"
+  internal_port = 50000
+
+  [[services.ports]]
+    port = 50000
 
 [[vm]]
 memory = "1gb"
