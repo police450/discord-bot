@@ -214,6 +214,23 @@ client.on("interactionCreate", async (interaction) => {
           console.log(`[DEBUG] Using FLY_PUBLIC_IP: ${publicIp}`);
         }
 
+        // Force IPv4 binding before voice connection
+        const dgram = require("dgram");
+        const originalCreateSocket = dgram.createSocket.bind(dgram);
+        dgram.createSocket = function(type, reuseAddr, callback) {
+          if (type === "udp4" || type.includes("4")) {
+            console.log(`[DEBUG] ✅ Forcing IPv4 socket creation`);
+            const socket = originalCreateSocket("udp4", reuseAddr, callback);
+            if (publicIp) {
+              socket.bind({ port: 0, address: publicIp }, () => {
+                console.log(`[DEBUG] ✅ Socket bound to IPv4: ${publicIp}`);
+              });
+            }
+            return socket;
+          }
+          return originalCreateSocket(type, reuseAddr, callback);
+        };
+
         guildState.connection = joinVoiceChannel({
           channelId: channel.id,
           guildId: channel.guild.id,
