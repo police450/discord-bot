@@ -229,31 +229,59 @@ client.on("interactionCreate", async (interaction) => {
         // Without this, Fly.io NAT causes the bot to report the wrong IP back to Discord,
         // causing the handshake to fail (Networking state 6 = UdpHandshakeFailed).
         if (publicIp) {
-          // Dump the full networking internals so we can find the UDP socket path
+          // Hook into the networking object's UDP debug handler to find and patch the socket.
+          // The UDP socket lives at networking._state.udp (private field) in @discordjs/voice v0.17.
+          // We patch it as soon as we see code=1 (UdpHandshaking) before code=6 (UdpHandshakeFailed).
+          let udpPatched = false;
+
           guildState.connection.on("stateChange", (_old, newState) => {
-            try {
-              const networking = newState?.networking;
-              if (!networking) {
-                console.log(`[DEBUG] No networking object in state: ${newState.status}`);
-                return;
-              }
-              // Log all top-level keys on networking and networking.state
-              console.log(`[DEBUG] networking keys: ${Object.keys(networking).join(", ")}`);
-              if (networking.state) {
-                console.log(`[DEBUG] networking.state keys: ${Object.keys(networking.state).join(", ")}`);
-                // Log one level deeper for each key
-                for (const k of Object.keys(networking.state)) {
-                  const v = networking.state[k];
-                  if (v && typeof v === "object") {
-                    console.log(`[DEBUG] networking.state.${k} keys: ${Object.keys(v).join(", ")}`);
-                  } else {
-                    console.log(`[DEBUG] networking.state.${k} = ${v}`);
+            if (udpPatched) return;
+            const networking = newState?.networking;
+            if (!networking) return;
+
+            // Poll for the UDP socket on the private _state field
+            let attempts = 0;
+            const poll = setInterval(() => {
+              attempts++;
+              try {
+                const udp = networking._state?.udp;
+                if (udp?.socket && !udpPatched) {
+                  udpPatched = true;
+                  clearInterval(poll);
+
+                  const socket = udp.socket;
+                  console.log(`[DEBUG] ✅ Found UDP socket via _state after ${attempts} attempts`);
+
+                  // Intercept incoming messages — IP discovery response is 74 bytes
+                  // Discord sends back the IP it sees (our NAT IP) — we rewrite it with our real public IP
+                  const origEmit = socket.emit.bind(socket);
+                  socket.emit = (event, ...args) => {
+                    if (event === "message" && Buffer.isBuffer(args[0]) && args[0].length === 74) {
+                      const buf = Buffer.from(args[0]);
+                      const nullIdx = buf.indexOf(0, 8);
+                      const reportedIp = buf.slice(8, nullIdx > 8 ? nullIdx : 72).toString("ascii").replace(/ /g, "");
+                      if (reportedIp && reportedIp !== publicIp) {
+                        console.log(`[DEBUG] IP discovery: Discord reports ${reportedIp}, rewriting to ${publicIp}`);
+                        buf.fill(0, 8, 72);
+                        buf.write(publicIp, 8, "ascii");
+                        return origEmit(event, buf, ...args.slice(1));
+                      }
+                    }
+                    return origEmit(event, ...args);
+                  };
+                } else if (attempts > 30) {
+                  clearInterval(poll);
+                  console.log(`[DEBUG] UDP socket not found in _state after ${attempts} attempts`);
+                  // Log _state keys for further diagnosis
+                  if (networking._state) {
+                    console.log(`[DEBUG] networking._state keys: ${Object.keys(networking._state).join(", ")}`);
                   }
                 }
+              } catch (e) {
+                clearInterval(poll);
+                console.error("[DEBUG] UDP patch poll error:", e.message);
               }
-            } catch (e) {
-              console.error("[DEBUG] Networking dump failed:", e.message);
-            }
+            }, 50);
           });
         }
 
