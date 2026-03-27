@@ -198,17 +198,20 @@ client.on("interactionCreate", async (interaction) => {
 
       try {
         console.log(`[DEBUG] Connecting to voice channel: ${channel.name}`);
-        // Get our public IPv4 from Fly metadata (set via flyctl ips allocate-v4)
+        // Get our public IPv4 — must be set via: flyctl secrets set FLY_PUBLIC_IP=<your-dedicated-v4>
         let publicIp = process.env.FLY_PUBLIC_IP || null;
+        console.log(`[DEBUG] FLY_PUBLIC_IP env: ${publicIp || "NOT SET"}`);
         if (!publicIp) {
           try {
             const ipRes = await fetch("https://api.ipify.org?format=json");
             const ipData = await ipRes.json();
             publicIp = ipData.ip;
-            console.log(`[DEBUG] Detected public IP: ${publicIp}`);
+            console.log(`[DEBUG] Detected public IP via ipify: ${publicIp}`);
           } catch (e) {
-            console.error("[DEBUG] Failed to get public IP:", e.message);
+            console.error("[DEBUG] Failed to get public IP via ipify:", e.message);
           }
+        } else {
+          console.log(`[DEBUG] Using FLY_PUBLIC_IP: ${publicIp}`);
         }
 
         guildState.connection = joinVoiceChannel({
@@ -221,32 +224,65 @@ client.on("interactionCreate", async (interaction) => {
           udpPortRange: [50000, 50000],
         });
 
-        // Patch the UDP socket to advertise our real public IP to Discord
-        // Without this, Fly.io NAT causes IP discovery to report the wrong address
+        // Patch the UDP socket to intercept Discord's IP discovery RESPONSE
+        // and rewrite the IP with our real public IP before @discordjs/voice reads it.
+        // Without this, Fly.io NAT causes the bot to report the wrong IP back to Discord,
+        // causing the handshake to fail (Networking state 6 = UdpHandshakeFailed).
         if (publicIp) {
-          guildState.connection.once(VoiceConnectionStatus.Connecting, () => {
+          const patchConnection = () => {
             try {
-              const networking = guildState.connection.state.networking;
-              if (networking) {
-                networking.once("stateChange", (_oldNet, newNet) => {
-                  if (newNet?.udp?.socket) {
-                    const socket = newNet.udp.socket;
-                    const origSend = socket.send.bind(socket);
-                    // Intercept the IP discovery packet and inject our real IP
-                    let ipDiscoverySent = false;
-                    socket.send = (buf, ...args) => {
-                      if (!ipDiscoverySent && Buffer.isBuffer(buf) && buf.length === 74) {
-                        ipDiscoverySent = true;
-                        console.log(`[DEBUG] IP discovery packet intercepted, public IP: ${publicIp}`);
-                      }
-                      return origSend(buf, ...args);
-                    };
+              const state = guildState.connection?.state;
+              const networking = state?.networking;
+              if (!networking) return;
+
+              const netState = networking.state;
+              const udp = netState?.udp;
+              if (!udp?.socket) return;
+
+              const socket = udp.socket;
+              if (socket._ipPatched) return;
+              socket._ipPatched = true;
+
+              const origEmit = socket.emit.bind(socket);
+              socket.emit = (event, ...args) => {
+                // IP discovery response is a UDP "message" event with a 74-byte packet
+                if (event === "message" && Buffer.isBuffer(args[0]) && args[0].length === 74) {
+                  const buf = Buffer.from(args[0]); // copy so we can mutate
+                  // Bytes 8–71 contain the null-terminated IP string in the discovery response
+                  const nullIdx = buf.indexOf(0, 8);
+                  const reportedIp = buf.slice(8, nullIdx).toString("ascii");
+                  if (reportedIp !== publicIp) {
+                    console.log(`[DEBUG] IP discovery: Discord sees ${reportedIp}, overriding with ${publicIp}`);
+                    buf.fill(0, 8, 72); // clear IP field
+                    buf.write(publicIp, 8, "ascii");
+                    return origEmit(event, buf, ...args.slice(1));
                   }
-                });
-              }
+                }
+                return origEmit(event, ...args);
+              };
+              console.log(`[DEBUG] ✅ IP discovery patch applied (public IP: ${publicIp})`);
             } catch (e) {
               console.error("[DEBUG] IP patch failed:", e.message);
             }
+          };
+
+          // Patch on every state change — UDP socket may not exist immediately on Connecting
+          guildState.connection.on("stateChange", (_old, newState) => {
+            console.log(`[DEBUG] Trying IP patch in state: ${newState.status}`);
+            // Poll for up to 2 seconds waiting for UDP socket to appear
+            let attempts = 0;
+            const poll = setInterval(() => {
+              patchConnection();
+              attempts++;
+              const patched = guildState.connection?.state?.networking?.state?.udp?.socket?._ipPatched;
+              if (patched) {
+                console.log(`[DEBUG] IP patch confirmed active after ${attempts} attempts`);
+                clearInterval(poll);
+              } else if (attempts > 20) {
+                console.log(`[DEBUG] IP patch not applied after ${attempts} attempts (UDP socket may not exist in this state)`);
+                clearInterval(poll);
+              }
+            }, 100);
           });
         }
 
