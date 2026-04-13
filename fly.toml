@@ -1,36 +1,23 @@
-app = "discord-voice-bot"
-primary_region = "lhr"
+# fly.toml app configuration file generated for discord-bot-8b3fbq on 2026-03-27T08:03:20Z
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
+
+app = 'discord-bot-8b3fbq'
+primary_region = 'ams'
 
 [build]
 
-[env]
-NODE_ENV = "production"
-
-# HTTP health check service
 [http_service]
-  internal_port = 8080
-  force_https = false
-  auto_stop_machines = "off"
+  internal_port = 3000
+  force_https = true
+  auto_stop_machines = 'stop'
   auto_start_machines = true
-  min_machines_running = 1
-
-  [[http_service.checks]]
-    interval = "15s"
-    timeout = "5s"
-    grace_period = "30s"
-    method = "GET"
-    path = "/"
-
-# UDP service for Discord voice (ports 1024-65535 outbound UDP must be open)
-# Discord voice servers use UDP on dynamic ports — we need outbound UDP unrestricted
-[[services]]
-  protocol = "udp"
-  internal_port = 50000
-
-  [[services.ports]]
-    port = 50000
+  min_machines_running = 0
+  processes = ['app']
 
 [[vm]]
-memory = "1gb"
-cpu_kind = "shared"
-cpus = 1
+  memory = '1gb'
+  cpu_kind = 'shared'
+  cpus = 1
+  memory_mb = 256
